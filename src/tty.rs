@@ -3,14 +3,14 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::herdr_cli;
 use crate::git;
+use crate::herdr_cli;
 use crate::hl::{self, ThemeId};
 use crate::model::{self, Snapshot};
-use crate::state;
 use crate::palette::{self, Palette};
 use crate::render::{self, Body, Frame, Target};
 use crate::screen::Line;
+use crate::state;
 
 const TICK: Duration = Duration::from_millis(1000);
 const SIZE_POLL: Duration = Duration::from_millis(500);
@@ -784,7 +784,7 @@ fn spawn_refresher(
                     }
                 }
             }
-            if scope_dirty || scope.is_none() || ticks % RESCAN_EVERY == 0 {
+            if scope_dirty || scope.is_none() || ticks.is_multiple_of(RESCAN_EVERY) {
                 match model::detect(&root, &touched) {
                     Ok(s) => scope = Some(s),
                     Err(e) => {
@@ -801,7 +801,7 @@ fn spawn_refresher(
                     last = None;
                 }
             }
-            if ticks % 2 == 0 {
+            if ticks.is_multiple_of(2) {
                 if let Some(me) = &me {
                     if let Ok(out) = herdr_cli::run(&["pane", "layout", "--pane", me]) {
                         if let Some((rows, cols)) = herdr_cli::pane_rect(&out, me) {
@@ -887,7 +887,15 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>, tab: &str) -> i32
     spawn_input(input, tx.clone());
     let (force_tx, force_rx) = mpsc::channel();
     let jobs = spawn_worker(agent.to_string(), me.clone(), tx.clone());
-    spawn_refresher(root.to_string(), agent.to_string(), theme.id, tx, force_rx, tab.to_string(), me);
+    spawn_refresher(
+        root.to_string(),
+        agent.to_string(),
+        theme.id,
+        tx,
+        force_rx,
+        tab.to_string(),
+        me,
+    );
 
     let mut r = Reader {
         rx,
@@ -1089,7 +1097,10 @@ mod tests {
         assert_eq!(app.theme, ThemeId::ViewerDark);
         assert_eq!(app.pal.bg, crate::palette::DARK.bg);
         assert_eq!(crate::state::load_theme().as_deref(), Some("diff-viewer"));
-        assert!(matches!(force_rx.try_recv(), Ok(Force::Theme(ThemeId::ViewerDark))));
+        assert!(matches!(
+            force_rx.try_recv(),
+            Ok(Force::Theme(ThemeId::ViewerDark))
+        ));
         crate::state::clear_theme();
         assert!(crate::state::load_theme().is_none());
         std::env::remove_var("DIFF_VIEWER_CONFIG_DIR");

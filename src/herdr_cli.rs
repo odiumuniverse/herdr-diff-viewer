@@ -73,7 +73,9 @@ pub fn pane_alive(pane: &str) -> bool {
 }
 
 pub fn pane_cwd(pane: &str) -> Option<String> {
-    run(&["pane", "get", pane]).ok().and_then(|out| pick_cwd(&out))
+    run(&["pane", "get", pane])
+        .ok()
+        .and_then(|out| pick_cwd(&out))
 }
 
 pub fn pick_cwd(json: &str) -> Option<String> {
@@ -132,11 +134,9 @@ mod tests {
 
     #[test]
     fn foreground_cwd_wins_over_pane_cwd() {
-        let out = r#"{"result":{"pane":{"cwd":"/Users/u/my","foreground_cwd":"/Users/u/topscan"}}}"#;
-        assert_eq!(
-            pick_cwd(out).as_deref(),
-            Some("/Users/u/topscan")
-        );
+        let out =
+            r#"{"result":{"pane":{"cwd":"/Users/u/my","foreground_cwd":"/Users/u/topscan"}}}"#;
+        assert_eq!(pick_cwd(out).as_deref(), Some("/Users/u/topscan"));
     }
 
     #[test]

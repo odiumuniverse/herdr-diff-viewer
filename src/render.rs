@@ -417,11 +417,7 @@ pub fn frame(v: &View) -> Frame {
         Some(f) => v.body.lines[v.body.headers[f]].clone(),
         None => {
             let mut l = Line::blank(w, base);
-            l.put(
-                PAD,
-                &format!("no changes · watching {}", v.snap.repos),
-                dim,
-            );
+            l.put(PAD, &format!("no changes · watching {}", v.snap.repos), dim);
             l
         }
     });
@@ -499,7 +495,11 @@ fn draw_menu(
         l.set_bg(left, right, bg);
         l.put(left, "│", Style::new(pal.sep, bg));
         l.put(right - 1, "│", Style::new(pal.sep, bg));
-        let mark = if m.items[i] == m.current { "●" } else { "○" };
+        let mark = if m.items[i] == m.current {
+            "●"
+        } else {
+            "○"
+        };
         let after_mark = l.put(left + 2, mark, Style::new(pal.dim, bg));
         let name_from = after_mark + 1;
         l.put(name_from, m.items[i].name(), Style::new(pal.fg, bg));

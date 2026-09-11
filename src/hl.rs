@@ -192,7 +192,7 @@ pub fn resolve_ctty(tty: &std::fs::File) -> Theme {
     Theme { id, syn: load(id) }
 }
 
-    pub(crate) fn named(name: &str) -> Option<ThemeId> {
+pub(crate) fn named(name: &str) -> Option<ThemeId> {
     match name {
         "dark" => Some(ThemeId::ClaudeDark),
         "light" => Some(ThemeId::ClaudeLight),

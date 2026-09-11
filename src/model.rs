@@ -134,7 +134,12 @@ pub fn signature(repos: &[String]) -> u64 {
     h.finish()
 }
 
-fn finish(mut main: Vec<FileView>, mut session: Vec<FileView>, repos: usize, theme: hl::ThemeId) -> Snapshot {
+fn finish(
+    mut main: Vec<FileView>,
+    mut session: Vec<FileView>,
+    repos: usize,
+    theme: hl::ThemeId,
+) -> Snapshot {
     main.sort_by(|a, b| a.display.cmp(&b.display));
     session.sort_by(|a, b| a.display.cmp(&b.display));
     let (files, adds, dels) = totals(&main, &session);
@@ -246,7 +251,7 @@ mod tests {
         assert!(s.anchor.is_none());
         assert_eq!(s.repos.len(), 1);
 
-        let s = detect(&base_s, &[outside_s.clone()]).unwrap();
+        let s = detect(&base_s, std::slice::from_ref(&outside_s)).unwrap();
         assert_eq!(s.repos.len(), 2);
         assert!(s.repos.contains(&git::canonical(&outside_s)));
 
@@ -255,8 +260,11 @@ mod tests {
         let s = detect(&base_s, &[sub.to_string_lossy().into_owned()]).unwrap();
         assert_eq!(s.repos.len(), 1, "subdir resolves to the child toplevel");
 
-        let s = detect(&child.to_string_lossy().into_owned(), &[outside_s]).unwrap();
-        assert_eq!(s.anchor.as_deref(), Some(git::canonical(&child.to_string_lossy()).as_str()));
+        let s = detect(&child.to_string_lossy(), &[outside_s]).unwrap();
+        assert_eq!(
+            s.anchor.as_deref(),
+            Some(git::canonical(&child.to_string_lossy()).as_str())
+        );
         assert_eq!(s.repos.len(), 2);
 
         let _ = std::fs::remove_dir_all(&base);

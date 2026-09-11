@@ -117,7 +117,8 @@ fn theme_cmd() -> i32 {
                 state::clear_theme();
                 return 0;
             }
-            let ok = matches!(name.as_str(), "dark" | "light") || hl::ThemeId::from_name(&name).is_some();
+            let ok = matches!(name.as_str(), "dark" | "light")
+                || hl::ThemeId::from_name(&name).is_some();
             if !ok {
                 eprintln!("unknown theme: {name}");
                 return 1;
@@ -188,7 +189,9 @@ mod tests {
 
     #[test]
     fn track_event_records_focused_agent_cwd_and_ignores_shells() {
-        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::state::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("dv-track-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

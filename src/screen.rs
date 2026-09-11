@@ -135,9 +135,15 @@ mod tests {
         l.put(0, "ab", Style::new((255, 80, 80), (112, 22, 30)));
         let mut out = String::new();
         l.encode(&mut out, Some(bg));
-        assert!(out.contains(";49m"), "base cells must use default bg: {out:?}");
+        assert!(
+            out.contains(";49m"),
+            "base cells must use default bg: {out:?}"
+        );
         assert!(!out.contains("48;2;38;38;38"), "{out:?}");
-        assert!(out.contains("48;2;112;22;30"), "hunk bg still paints: {out:?}");
+        assert!(
+            out.contains("48;2;112;22;30"),
+            "hunk bg still paints: {out:?}"
+        );
     }
 
     #[test]
