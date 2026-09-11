@@ -26,7 +26,14 @@ pub fn pane_id_after(out: &str, marker: &str) -> Option<String> {
 }
 
 pub fn open_viewer(agent: &str, cwd: &str, tab: &str) -> Result<String, String> {
-    run(&[
+    let agent_env = format!("DIFF_AGENT={agent}");
+    let repo_env = format!("DIFF_REPO={cwd}");
+    let tab_env = format!("DIFF_TAB={tab}");
+    let theme_env = std::env::var("DIFF_THEME")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("DIFF_THEME={t}"));
+    let mut args = vec![
         "plugin",
         "pane",
         "open",
@@ -44,12 +51,17 @@ pub fn open_viewer(agent: &str, cwd: &str, tab: &str) -> Result<String, String> 
         cwd,
         "--no-focus",
         "--env",
-        &format!("DIFF_AGENT={agent}"),
+        agent_env.as_str(),
         "--env",
-        &format!("DIFF_REPO={cwd}"),
+        repo_env.as_str(),
         "--env",
-        &format!("DIFF_TAB={tab}"),
-    ])
+        tab_env.as_str(),
+    ];
+    if let Some(t) = &theme_env {
+        args.push("--env");
+        args.push(t.as_str());
+    }
+    run(&args)
 }
 
 pub fn close_pane(pane: &str) -> Result<(), String> {
