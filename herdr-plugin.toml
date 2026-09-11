@@ -14,10 +14,6 @@ title = "Diff viewer: toggle session diff sidebar"
 contexts = ["pane"]
 command = ["./target/release/diff-viewer", "toggle"]
 
-# Full-height diff sidebar. Opened programmatically by the `toggle` action via
-# `herdr plugin pane open --entrypoint viewer --placement split`, which spawns
-# this command non-interactively. The tab id comes from herdr's HERDR_TAB_ID
-# env (set for plugin panes); repo + agent pane arrive via --env (see main).
 [[panes]]
 id = "viewer"
 title = "session diff"

@@ -3,16 +3,16 @@
 <plist version="1.0">
 <dict>
 	<key>name</key>
-	<string>Diff Viewer</string>
+	<string>Catppuccin</string>
 	<key>settings</key>
 	<array>
 		<dict>
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#D4D4D4</string>
+				<string>#CDD6F4</string>
 				<key>background</key>
-				<string>#1E1E1E</string>
+				<string>#181825</string>
 			</dict>
 		</dict>
 		<dict>
@@ -23,7 +23,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#6A9955</string>
+				<string>#6C7086</string>
 			</dict>
 		</dict>
 		<dict>
@@ -34,7 +34,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#FF79C6</string>
+				<string>#CBA6F7</string>
 			</dict>
 		</dict>
 		<dict>
@@ -45,18 +45,18 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#DCDCAA</string>
+				<string>#F9E2AF</string>
 			</dict>
 		</dict>
 		<dict>
 			<key>name</key>
 			<string>Type</string>
 			<key>scope</key>
-			<string>entity.name.type, entity.name.class, support.class, storage.type.user-defined</string>
+			<string>entity.name.type, entity.name.class, support.class</string>
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#8DD6F8</string>
+				<string>#89B4FA</string>
 			</dict>
 		</dict>
 		<dict>
@@ -67,7 +67,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#CE9178</string>
+				<string>#A6E3A1</string>
 			</dict>
 		</dict>
 		<dict>
@@ -78,7 +78,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#B5CEA8</string>
+				<string>#FAB387</string>
 			</dict>
 		</dict>
 		<dict>
@@ -89,7 +89,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#DCDCAA</string>
+				<string>#F9E2AF</string>
 			</dict>
 		</dict>
 		<dict>
@@ -100,7 +100,7 @@
 			<key>settings</key>
 			<dict>
 				<key>foreground</key>
-				<string>#8DD6F8</string>
+				<string>#94E2D5</string>
 			</dict>
 		</dict>
 	</array>

@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use crate::ctx::find_str;
 
-/// Per-tab toggle state: which viewer pane is open and where it sends to.
 pub struct ToggleState {
     pub viewer_pane: String,
     pub agent_pane: String,
@@ -55,7 +54,6 @@ mod tests {
 
     #[test]
     fn roundtrip() {
-        // Given a state value When saved and loaded Then all fields survive.
         let tab = "test_tab_roundtrip_xyz";
         let st = ToggleState {
             viewer_pane: "w1:p9".into(),

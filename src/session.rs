@@ -1,15 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
-/// Which agent session the viewer filters by. Resolved once from the agent
-/// pane; the touched set reloads on every rebuild since the log grows.
 pub struct SessionRef {
     pub agent: String,
     pub id: String,
     pub cwd: String,
 }
 
-/// `herdr agent get` -> (agent kind, session value, pane cwd), scoped inside
-/// `"agent_session"` so token-quota blobs cannot shadow the fields.
 pub fn resolve(agent_pane: &str) -> Option<SessionRef> {
     let out = crate::herdr_cli::run(&["agent", "get", agent_pane]).ok()?;
     let i = out.find("\"agent_session\"")?;
@@ -28,7 +24,6 @@ fn scoped(json: &str, key: &str) -> Option<String> {
     crate::ctx::find_str(&json[i..], key)
 }
 
-/// Validate before interpolating into sqlite (opencode ids are `ses_*`).
 fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -36,9 +31,6 @@ fn safe_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-/// Cache so every rebuild (`r`, `t`, clicks) does not re-read multi-MB
-/// transcripts, re-walk log dirs, or re-query sqlite: keyed by
-/// (size, mtime) per backing file.
 pub struct SessCache {
     db: Option<(u64, u64, Vec<String>)>,
     logs: HashMap<String, (u64, u64, Vec<String>)>,
@@ -64,8 +56,6 @@ fn sig(path: &str) -> Option<(u64, u64)> {
     Some((m.len(), t))
 }
 
-/// Absolute paths this session edited (writes count, reads don't).
-/// Cached variant — plain `edited_files` was removed, the cache is cheap.
 pub fn edited_files_cached(s: &SessionRef, cache: &mut SessCache) -> Vec<String> {
     match s.agent.as_str() {
         "opencode" => {
@@ -117,7 +107,7 @@ fn mine_logs_cached(s: &SessionRef, dialect: Lines, cache: &mut SessCache) -> Ve
         let had = !paths.is_empty();
         set.extend(paths);
         if had {
-            break; // session ids are unique — first hit wins
+            break;
         }
     }
     let mut v: Vec<String> = set.into_iter().collect();
@@ -151,7 +141,6 @@ fn mine_opencode_db(db: &str, id: &str) -> Vec<String> {
         return Vec::new();
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    // One compact doc per row (serde never emits raw newlines inside strings).
     let mut set = HashSet::new();
     for line in text.lines() {
         if let Some(p) = parse_opencode_row(line) {
@@ -163,8 +152,6 @@ fn mine_opencode_db(db: &str, id: &str) -> Vec<String> {
     v
 }
 
-/// One opencode `part` doc -> edited path, or None (reads, steps, failures).
-/// Compact-shape contains-gate: `type`/`tool` field order is not contracted.
 pub fn parse_opencode_row(doc: &str) -> Option<String> {
     let is_edit = doc.contains("\"tool\":\"write\"") || doc.contains("\"tool\":\"edit\"");
     if !is_edit {
@@ -181,10 +168,6 @@ pub(crate) enum Lines {
 
 use Lines::{Claude, Pi};
 
-/// JSONL miners for claude/pi: one pass per line, flat field scan (no JSON
-/// dep by design — see ctx::find_str). Edited tools only. The item-type gate
-/// is a contains-check because the record's own top-level `type`
-/// (`assistant`/`message`) always precedes the content item's.
 pub fn parse_jsonl_line(line: &str, dialect: Lines) -> Option<String> {
     let find = crate::ctx::find_str;
     match dialect {
@@ -222,12 +205,10 @@ fn dialect_agent(d: &Lines) -> &'static str {
     }
 }
 
-/// Transcript locations, mirroring herdr-nvim's proven layouts.
 fn candidate_logs(agent: &str, id: &str, cwd: &str) -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut out = Vec::new();
     if agent == "claude" {
-        // Claude slug keeps a LEADING dash: /Users/u/my -> -Users-u-my.
         let slug = format!("-{}", cwd.replace('/', "-"));
         out.push(format!("{home}/.claude/projects/{slug}/{id}.jsonl"));
         if let Ok(dirs) = std::fs::read_dir(format!("{home}/.claude/projects")) {
@@ -261,7 +242,6 @@ mod tests {
 
     #[test]
     fn opencode_row_routes_by_tool() {
-        // Given part docs When parsing Then write/edit yield paths, rest miss.
         let w = r#"{"type":"tool","tool":"write","state":{"input":{"filePath":"/r/a.rs"}}}"#;
         let e = r#"{"type":"tool","tool":"edit","state":{"input":{"filePath":"/r/b.rs"}}}"#;
         let r = r#"{"type":"tool","tool":"read","state":{"input":{"filePath":"/r/c.rs"}}}"#;
@@ -274,7 +254,6 @@ mod tests {
 
     #[test]
     fn claude_line_routes_by_tool_use() {
-        // Given claude JSONL lines (outer record type precedes the item).
         let w = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/r/a.rs"}}]}}"#;
         let m = r#"{"message":{"content":[{"type":"tool_use","name":"MultiEdit","input":{"file_path":"/r/b.rs"}}]}}"#;
         let r = r#"{"message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/r/c.rs"}}]}}"#;
@@ -287,7 +266,6 @@ mod tests {
 
     #[test]
     fn pi_line_routes_by_tool_call() {
-        // Given pi JSONL lines When parsing Then write/edit yield, others miss.
         let w = r#"{"type":"message","message":{"content":[{"type":"toolCall","name":"write","arguments":{"path":"/r/a.rs"}}]}}"#;
         let b = r#"{"type":"message","message":{"content":[{"type":"toolCall","name":"bash","arguments":{"cmd":"ls"}}]}}"#;
         assert_eq!(parse_jsonl_line(w, Pi).as_deref(), Some("/r/a.rs"));

@@ -15,16 +15,15 @@ fn main() {
     let code = match env::args().nth(1).as_deref() {
         Some("toggle") => toggle(),
         Some("viewer") => viewer(),
+        Some("themes") => themes(),
         _ => {
-            eprintln!("usage: diff-viewer <toggle|viewer>");
+            eprintln!("usage: diff-viewer <toggle|viewer|themes>");
             2
         }
     };
     std::process::exit(code);
 }
 
-/// Toggle action: close the tab's viewer pane if live, else open a fresh
-/// split on the right of the calling (agent) pane.
 fn toggle() -> i32 {
     let ctx = match ctx::read_action_ctx() {
         Ok(c) => c,
@@ -39,7 +38,7 @@ fn toggle() -> i32 {
             state::remove(&ctx.tab);
             return 0;
         }
-        state::remove(&ctx.tab); // stale record, fall through to open
+        state::remove(&ctx.tab);
     }
     let out = match herdr_cli::open_viewer(&ctx.agent_pane, &ctx.cwd, &ctx.tab) {
         Ok(o) => o,
@@ -67,8 +66,17 @@ fn toggle() -> i32 {
     }
 }
 
-/// Viewer entrypoint: runs inside the plugin pane. Tab comes from herdr's
-/// own env; agent + repo were passed via --env at open time.
+fn themes() -> i32 {
+    for id in hl::ThemeId::all() {
+        println!(
+            "{}\t{}",
+            id.name(),
+            if id.is_dark() { "dark" } else { "light" }
+        );
+    }
+    0
+}
+
 fn viewer() -> i32 {
     let tab = env::var("DIFF_TAB")
         .or_else(|_| env::var("HERDR_TAB_ID"))
@@ -94,7 +102,5 @@ fn viewer() -> i32 {
         eprintln!("diff-viewer: {repo_src} is gone — reopen via the toggle action");
         return 1;
     }
-    // Scope (single repo vs gitless root with repo children) resolves inside
-    // run_viewer so `r` picks up newly appeared repos too.
     tty::run_viewer(&agent, &repo_src)
 }

@@ -2,13 +2,9 @@ use crate::git::{self, DiffLine};
 use crate::group::{classify, Group};
 use crate::hl::{self, Span};
 
-/// One file card: stats for the list row, hunks for the section below.
-/// `path` is repo-relative (git ops); `display` is shown and sent to the
-/// agent (`svc/`-prefixed in multi-repo mode). `hl[i]` colors `hunks[i]`.
 pub struct FileView {
     pub path: String,
     pub display: String,
-    /// Absolute path — the session filter matches mined absolute paths here.
     pub abs: String,
     pub adds: u32,
     pub dels: u32,
@@ -25,14 +21,11 @@ pub struct Snapshot {
     pub dels: u64,
 }
 
-/// Diff scope: one repo, or a gitless root (like ~/topscan) whose direct
-/// children are repos — their diffs merge with `svc/`-prefixed paths.
 pub enum Scope {
     Single(String),
     Multi(String, Vec<String>),
 }
 
-/// Resolve scope from any cwd: inside a repo -> it; else child repos.
 pub fn detect(root: &str) -> Result<Scope, String> {
     if git::toplevel(root).is_ok() {
         return Ok(Scope::Single(root.to_string()));
@@ -46,8 +39,6 @@ pub fn detect(root: &str) -> Result<Scope, String> {
     Ok(Scope::Multi(root.to_string(), repos))
 }
 
-/// Working tree vs HEAD, split into main + collapsed tests/generated.
-/// Deterministic alphabetical order like the screenshot's list.
 pub fn build(scope: &Scope) -> Result<Snapshot, String> {
     match scope {
         Scope::Single(top) => {
@@ -90,9 +81,6 @@ fn totals(main: &[FileView], session: &[FileView]) -> (usize, u64, u64) {
     (files, adds, dels)
 }
 
-/// Keep only files this session touched (absolute match or `/display`
-/// suffix — logs carry absolute paths, the snapshot repo-relative ones).
-/// Multi-session repos then show just one agent's footprint.
 pub fn retain_session(snap: &mut Snapshot, touched: &[String]) {
     let keep = |f: &FileView| {
         let disp = format!("/{}", f.display);
@@ -112,6 +100,7 @@ fn build_one(top: &str) -> Result<(Vec<FileView>, Vec<FileView>), String> {
     let entries = git::status(top)?;
     let stats = git::numstat(top);
     let all = git::unified_all(top);
+    let theme = hl::resolve();
     let mut main = Vec::new();
     let mut session = Vec::new();
     for e in &entries {
@@ -134,7 +123,7 @@ fn build_one(top: &str) -> Result<(Vec<FileView>, Vec<FileView>), String> {
             dels,
             group: classify(&e.path),
             hunks,
-            hl: hl::highlight(&e.path, &texts),
+            hl: hl::highlight(&e.path, &texts, &theme),
         };
         if file.group == Group::Session {
             session.push(file);
@@ -151,8 +140,6 @@ mod tests {
 
     #[test]
     fn retain_keeps_session_files_only() {
-        // Given a snapshot with two files When retaining one session path
-        // Then only the touched file (abs match) survives with fresh totals.
         let mk = |display: &str, abs: &str| FileView {
             path: display.into(),
             display: display.into(),

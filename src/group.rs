@@ -1,6 +1,3 @@
-/// File bucket. The screenshot groups both under one collapsed
-/// `N tests/generated (show)` row — tests you usually want hidden until
-/// asked, generated you almost never want to read.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Group {
     Main,
@@ -58,7 +55,6 @@ mod tests {
 
     #[test]
     fn buckets_match_screenshot_groups() {
-        // Given repo paths When classifying Then tests/generated collapse.
         assert_eq!(classify("CHANGELOG.md"), Group::Main);
         assert_eq!(classify("src/color.rs"), Group::Main);
         assert_eq!(classify("src/util.rs"), Group::Main);
