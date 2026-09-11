@@ -34,6 +34,7 @@ pub enum ThemeId {
     RosePine,
     RosePineDawn,
     Vesper,
+    Transparent,
 }
 
 impl ThemeId {
@@ -61,6 +62,7 @@ impl ThemeId {
             ThemeId::RosePine,
             ThemeId::RosePineDawn,
             ThemeId::Vesper,
+            ThemeId::Transparent,
         ]
     }
 
@@ -88,6 +90,7 @@ impl ThemeId {
             ThemeId::RosePine => "rose-pine",
             ThemeId::RosePineDawn => "rose-pine-dawn",
             ThemeId::Vesper => "vesper",
+            ThemeId::Transparent => "transparent",
         }
     }
 
@@ -132,6 +135,7 @@ impl ThemeId {
             "rose-pine" | "rosepine" => Some(ThemeId::RosePine),
             "rose-pine-dawn" | "rosepine-dawn" | "dawn" => Some(ThemeId::RosePineDawn),
             "vesper" => Some(ThemeId::Vesper),
+            "transparent" | "transparent-dark" | "ghost" => Some(ThemeId::Transparent),
             _ => None,
         }
     }
@@ -160,6 +164,7 @@ impl ThemeId {
             ThemeId::RosePine => include_bytes!("../assets/rose-pine.tmTheme"),
             ThemeId::RosePineDawn => include_bytes!("../assets/rose-pine-dawn.tmTheme"),
             ThemeId::Vesper => include_bytes!("../assets/vesper.tmTheme"),
+            ThemeId::Transparent => include_bytes!("../assets/claude-code-dark.tmTheme"),
         }
     }
 }
@@ -175,14 +180,24 @@ fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(SyntaxSet::load_defaults_nonewlines)
 }
 
+use crate::state;
+
 pub fn resolve_ctty(tty: &std::fs::File) -> Theme {
-    let id = match std::env::var("DIFF_THEME").ok().as_deref() {
-        Some("dark") => ThemeId::ClaudeDark,
-        Some("light") => ThemeId::ClaudeLight,
-        Some(name) => ThemeId::from_name(name).unwrap_or_else(|| default_ctty(tty)),
-        None => default_ctty(tty),
-    };
+    let id = std::env::var("DIFF_THEME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|n| named(&n))
+        .or_else(|| state::load_theme().and_then(|n| named(&n)))
+        .unwrap_or_else(|| default_ctty(tty));
     Theme { id, syn: load(id) }
+}
+
+    pub(crate) fn named(name: &str) -> Option<ThemeId> {
+    match name {
+        "dark" => Some(ThemeId::ClaudeDark),
+        "light" => Some(ThemeId::ClaudeLight),
+        _ => ThemeId::from_name(name),
+    }
 }
 
 fn default_ctty(tty: &std::fs::File) -> ThemeId {
@@ -308,7 +323,7 @@ mod tests {
 
     #[test]
     fn registry_covers_all_herdr_names() {
-        assert_eq!(ThemeId::all().len(), 22);
+        assert_eq!(ThemeId::all().len(), 23);
         for name in [
             "catppuccin",
             "catppuccin-latte",
@@ -328,6 +343,7 @@ mod tests {
             "rose-pine",
             "rose-pine-dawn",
             "vesper",
+            "transparent",
         ] {
             assert!(ThemeId::from_name(name).is_some(), "{name}");
         }

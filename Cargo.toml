@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# fancy-regex (pure Rust) instead of onig (C): same dumps, far cheaper
-# clean builds and CI. If highlighting ever misbehaves, flip to default.
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [profile.release]

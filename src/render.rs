@@ -1,5 +1,5 @@
 use crate::git::{DLKind, DiffLine};
-use crate::hl::Span;
+use crate::hl::{Span, ThemeId};
 use crate::model::{FileView, Snapshot};
 use crate::palette::{Palette, Rgb};
 use crate::screen::{Line, Style};
@@ -14,6 +14,8 @@ pub enum Target {
     File(usize),
     Group,
     Close,
+    ThemeBtn,
+    Theme(usize),
 }
 
 pub enum Row {
@@ -119,6 +121,15 @@ pub struct View<'a> {
     pub hover: Option<Target>,
     pub sel: Option<((usize, usize), (usize, usize))>,
     pub pal: &'a Palette,
+    pub menu: Option<MenuView<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct MenuView<'a> {
+    pub items: &'a [ThemeId],
+    pub sel: usize,
+    pub off: usize,
+    pub current: ThemeId,
 }
 
 pub fn file_at(snap: &Snapshot, i: usize) -> &FileView {
@@ -340,13 +351,23 @@ pub fn frame(v: &View) -> Frame {
         &format!("+{}", v.snap.adds),
         Style::new(pal.add_fg, pal.bg),
     );
-    head.put(
+    let c = head.put(
         c + 1,
         &format!("-{}", v.snap.dels),
         Style::new(pal.del_fg, pal.bg),
     );
+    let c = head.put(c + 1, &format!("· watching {}", v.snap.repos), dim);
+    head.put(c + 1, &format!("· {}", v.snap.theme.name()), dim);
     let close = w.saturating_sub(PAD + 1);
+    let btn = close.saturating_sub(2);
     head.put(close, "×", dim.underlined(v.hover == Some(Target::Close)));
+    head.put(btn, "◑", dim.underlined(v.hover == Some(Target::ThemeBtn)));
+    hits.push(Hit {
+        row: 1,
+        from: btn.saturating_sub(1),
+        to: btn + 1,
+        target: Target::ThemeBtn,
+    });
     hits.push(Hit {
         row: 1,
         from: close.saturating_sub(1),
@@ -396,7 +417,11 @@ pub fn frame(v: &View) -> Frame {
         Some(f) => v.body.lines[v.body.headers[f]].clone(),
         None => {
             let mut l = Line::blank(w, base);
-            l.put(PAD, "no changes", dim);
+            l.put(
+                PAD,
+                &format!("no changes · watching {}", v.snap.repos),
+                dim,
+            );
             l
         }
     });
@@ -427,7 +452,74 @@ pub fn frame(v: &View) -> Frame {
         lines.push(l);
     }
 
+    if let Some(m) = v.menu {
+        draw_menu(&mut lines, &mut hits, &geo, m, w, pal, v.hover);
+    }
+
     Frame { lines, hits, geo }
+}
+
+fn draw_menu(
+    lines: &mut [Line],
+    hits: &mut Vec<Hit>,
+    geo: &Geometry,
+    m: MenuView,
+    w: usize,
+    pal: &Palette,
+    hover: Option<Target>,
+) {
+    let base = Style::new(pal.fg, pal.bg);
+    let sep = Style::new(pal.sep, pal.bg);
+    let mut inner = 0;
+    for t in m.items {
+        inner = inner.max(t.name().chars().count());
+    }
+    inner += 4;
+    let right = w.saturating_sub(PAD);
+    let left = right.saturating_sub(inner + 2);
+    let count = m
+        .items
+        .len()
+        .saturating_sub(m.off)
+        .min(geo.body_h.saturating_sub(2));
+    if count == 0 || left + 2 >= right || geo.body_top >= lines.len() {
+        return;
+    }
+    let mut top = Line::blank(w, base);
+    top.put(left, &format!("┌{}┐", "─".repeat(inner)), sep);
+    lines[geo.body_top] = top;
+    for k in 0..count {
+        let i = m.off + k;
+        let row = geo.body_top + 1 + k;
+        if row >= lines.len() {
+            break;
+        }
+        let bg = if i == m.sel { pal.active_bg } else { pal.bg };
+        let mut l = Line::blank(w, base);
+        l.set_bg(left, right, bg);
+        l.put(left, "│", Style::new(pal.sep, bg));
+        l.put(right - 1, "│", Style::new(pal.sep, bg));
+        let mark = if m.items[i] == m.current { "●" } else { "○" };
+        let after_mark = l.put(left + 2, mark, Style::new(pal.dim, bg));
+        let name_from = after_mark + 1;
+        l.put(name_from, m.items[i].name(), Style::new(pal.fg, bg));
+        if hover == Some(Target::Theme(i)) {
+            l.underline(name_from, name_from + m.items[i].name().chars().count());
+        }
+        hits.push(Hit {
+            row,
+            from: left,
+            to: right,
+            target: Target::Theme(i),
+        });
+        lines[row] = l;
+    }
+    let brow = geo.body_top + 1 + count;
+    if brow < lines.len() {
+        let mut bot = Line::blank(w, base);
+        bot.put(left, &format!("└{}┘", "─".repeat(inner)), sep);
+        lines[brow] = bot;
+    }
 }
 
 pub fn selection_payload(body: &Body, a: (usize, usize), c: (usize, usize)) -> Option<String> {
@@ -544,6 +636,8 @@ mod tests {
             files,
             adds,
             dels,
+            repos: 1,
+            theme: ThemeId::ClaudeDark,
         }
     }
 
@@ -572,6 +666,7 @@ mod tests {
             hover,
             sel: None,
             pal: &DARK,
+            menu: None,
         }
     }
 
@@ -792,5 +887,26 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn theme_menu_overlays_body_with_clickable_rows() {
+        let s = snap(vec![one_line("a.rs")], vec![]);
+        let b = body(&s, false, 40, &DARK);
+        let items = [ThemeId::ClaudeDark, ThemeId::Transparent];
+        let mut v = view(&s, &b, None);
+        v.menu = Some(MenuView {
+            items: &items,
+            sel: 1,
+            off: 0,
+            current: ThemeId::ClaudeDark,
+        });
+        let f = frame(&v);
+        assert_eq!(f.lines.len(), 30);
+        assert_eq!(f.hit(1, 36), Some(Target::ThemeBtn));
+        assert_eq!(f.hit(1, 38), Some(Target::Close));
+        let mrow = f.geo.body_top + 2;
+        assert_eq!(f.hit(mrow, 20), Some(Target::Theme(1)));
+        assert!(f.lines[mrow].text().contains("transparent"));
     }
 }

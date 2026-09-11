@@ -72,6 +72,33 @@ pub fn pane_alive(pane: &str) -> bool {
     run(&["pane", "get", pane]).is_ok()
 }
 
+pub fn pane_cwd(pane: &str) -> Option<String> {
+    run(&["pane", "get", pane]).ok().and_then(|out| pick_cwd(&out))
+}
+
+pub fn pick_cwd(json: &str) -> Option<String> {
+    find_str(json, "foreground_cwd")
+        .filter(|s| !s.is_empty())
+        .or_else(|| find_str(json, "cwd").filter(|s| !s.is_empty()))
+}
+
+pub fn pane_rect(out: &str, pane: &str) -> Option<(usize, usize)> {
+    let marker = format!("\"pane_id\":\"{pane}\"");
+    let rest = out.get(out.find(&marker)?..)?;
+    let rr = rest.get(rest.find("\"rect\"")?..)?;
+    Some((num_field(rr, "\"height\"")?, num_field(rr, "\"width\"")?))
+}
+
+fn num_field(s: &str, key: &str) -> Option<usize> {
+    let after = s.get(s.find(key)? + key.len()..)?;
+    let digits: String = after
+        .trim_start_matches([' ', ':'])
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 pub fn send_text(pane: &str, text: &str) -> Result<(), String> {
     run(&["pane", "send-text", pane, text]).map(|_| ())
 }
@@ -101,5 +128,35 @@ mod tests {
     #[test]
     fn unknown_marker_is_none() {
         assert_eq!(pane_id_after(r#"{"a":1}"#, "\"plugin_pane\""), None);
+    }
+
+    #[test]
+    fn foreground_cwd_wins_over_pane_cwd() {
+        let out = r#"{"result":{"pane":{"cwd":"/Users/u/my","foreground_cwd":"/Users/u/topscan"}}}"#;
+        assert_eq!(
+            pick_cwd(out).as_deref(),
+            Some("/Users/u/topscan")
+        );
+    }
+
+    #[test]
+    fn pane_cwd_is_fallback_when_foreground_missing() {
+        let out = r#"{"result":{"pane":{"cwd":"/Users/u/my"}}}"#;
+        assert_eq!(pick_cwd(out).as_deref(), Some("/Users/u/my"));
+    }
+
+    #[test]
+    fn empty_cwds_are_missing() {
+        assert_eq!(pick_cwd(r#"{"cwd":"","foreground_cwd":""}"#), None);
+        assert_eq!(pick_cwd(r#"{"n":1}"#), None);
+    }
+
+    #[test]
+    fn pane_rect_reads_own_rect_after_pane_id() {
+        let out = r#"{"result":{"layout":{"area":{"height":58,"width":188},"panes":[{"focused":true,"pane_id":"w4:p1","rect":{"height":58,"width":94,"x":0,"y":0}},{"focused":false,"pane_id":"w4:p2E","rect":{"height":58,"width":94,"x":94,"y":0}}]}}}"#;
+        assert_eq!(pane_rect(out, "w4:p2E"), Some((58, 94)));
+        assert_eq!(pane_rect(out, "w4:p1"), Some((58, 94)));
+        assert_eq!(pane_rect(out, "w4:nope"), None);
+        assert_eq!(pane_rect(r#"{"pane_id":"w4:p2E"}"#, "w4:p2E"), None);
     }
 }

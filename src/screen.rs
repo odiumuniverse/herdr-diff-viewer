@@ -84,12 +84,13 @@ impl Line {
         self.cells.iter().map(|c| c.ch).collect()
     }
 
-    pub fn encode(&self, out: &mut String) {
-        let mut cur: Option<Style> = None;
+    pub fn encode(&self, out: &mut String, default_bg: Option<Rgb>) {
+        let mut cur: Option<(Style, bool)> = None;
         for cell in &self.cells {
-            if cur != Some(cell.st) {
-                push_sgr(out, cell.st);
-                cur = Some(cell.st);
+            let plain = default_bg.is_some_and(|d| cell.st.bg == d);
+            if cur != Some((cell.st, plain)) {
+                push_sgr(out, cell.st, plain);
+                cur = Some((cell.st, plain));
             }
             out.push(cell.ch);
         }
@@ -97,15 +98,19 @@ impl Line {
     }
 }
 
-fn push_sgr(out: &mut String, st: Style) {
+fn push_sgr(out: &mut String, st: Style, default_bg: bool) {
     let (fr, fg, fb) = st.fg;
     let (br, bg, bb) = st.bg;
     let bold = if st.bold { "1;" } else { "" };
     let under = if st.underline { "4;" } else { "" };
-    let _ = write!(
-        out,
-        "\x1b[0;{bold}{under}38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m"
-    );
+    if default_bg {
+        let _ = write!(out, "\x1b[0;{bold}{under}38;2;{fr};{fg};{fb};49m");
+    } else {
+        let _ = write!(
+            out,
+            "\x1b[0;{bold}{under}38;2;{fr};{fg};{fb};48;2;{br};{bg};{bb}m"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -118,9 +123,21 @@ mod tests {
         let mut l = Line::blank(6, Style::new((1, 1, 1), bg));
         l.put(0, "ab", Style::new((9, 9, 9), bg));
         let mut out = String::new();
-        l.encode(&mut out);
+        l.encode(&mut out, None);
         assert_eq!(out.matches("48;2;0;97;0").count(), 2);
         assert!(out.ends_with("    \x1b[0m"), "{out:?}");
+    }
+
+    #[test]
+    fn encode_emits_default_bg_for_transparent_base() {
+        let bg = (38, 38, 38);
+        let mut l = Line::blank(4, Style::new((232, 232, 232), bg));
+        l.put(0, "ab", Style::new((255, 80, 80), (112, 22, 30)));
+        let mut out = String::new();
+        l.encode(&mut out, Some(bg));
+        assert!(out.contains(";49m"), "base cells must use default bg: {out:?}");
+        assert!(!out.contains("48;2;38;38;38"), "{out:?}");
+        assert!(out.contains("48;2;112;22;30"), "hunk bg still paints: {out:?}");
     }
 
     #[test]

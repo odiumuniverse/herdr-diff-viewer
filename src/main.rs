@@ -16,9 +16,11 @@ fn main() {
     let code = match env::args().nth(1).as_deref() {
         Some("toggle") => toggle(),
         Some("viewer") => viewer(),
+        Some("track-event") => track_event(),
+        Some("theme") => theme_cmd(),
         Some("themes") => themes(),
         _ => {
-            eprintln!("usage: diff-viewer <toggle|viewer|themes>");
+            eprintln!("usage: diff-viewer <toggle|viewer|track-event|theme [name]|themes>");
             2
         }
     };
@@ -66,6 +68,71 @@ fn toggle() -> i32 {
     0
 }
 
+fn track_event() -> i32 {
+    if std::env::var("DIFF_TRACK").is_ok_and(|v| v == "0") {
+        return 0;
+    }
+    let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
+    if !ctx.is_empty() {
+        let agent = ctx::find_str(&ctx, "focused_pane_agent").unwrap_or_default();
+        if !agent.is_empty() {
+            if let (Some(tab), Some(cwd)) = (
+                ctx::find_str(&ctx, "tab_id"),
+                ctx::find_str(&ctx, "focused_pane_cwd"),
+            ) {
+                if !cwd.is_empty() {
+                    state::note_touched(&tab, &cwd);
+                    return 0;
+                }
+            }
+        }
+    }
+    let evt = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    let Some(pane) = ctx::find_str(&evt, "pane_id") else {
+        return 0;
+    };
+    let Ok(out) = herdr_cli::run(&["pane", "get", &pane]) else {
+        return 0;
+    };
+    if ctx::find_str(&out, "agent").is_none() {
+        return 0;
+    }
+    if let (Some(tab), Some(cwd)) = (ctx::find_str(&out, "tab_id"), herdr_cli::pick_cwd(&out)) {
+        state::note_touched(&tab, &cwd);
+    }
+    0
+}
+
+fn theme_cmd() -> i32 {
+    match env::args().nth(2) {
+        None => {
+            match state::load_theme() {
+                Some(n) => println!("{n}"),
+                None => println!("(auto)"),
+            }
+            0
+        }
+        Some(name) => {
+            if name == "auto" {
+                state::clear_theme();
+                return 0;
+            }
+            let ok = matches!(name.as_str(), "dark" | "light") || hl::ThemeId::from_name(&name).is_some();
+            if !ok {
+                eprintln!("unknown theme: {name}");
+                return 1;
+            }
+            match state::save_theme(&name) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("diff-viewer: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
 fn themes() -> i32 {
     for id in hl::ThemeId::all() {
         println!(
@@ -105,7 +172,7 @@ fn viewer() -> i32 {
     let me = env::var("HERDR_PANE_ID")
         .ok()
         .filter(|p| !p.is_empty() && *p != agent);
-    let code = tty::run_viewer(&agent, &repo_src, me.clone());
+    let code = tty::run_viewer(&agent, &repo_src, me.clone(), &tab);
     if code == 0 {
         if let Some(me) = me {
             state::remove(&tab);
@@ -113,4 +180,37 @@ fn viewer() -> i32 {
         }
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_event_records_focused_agent_cwd_and_ignores_shells() {
+        let _guard = crate::state::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dv-track-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+
+        std::env::set_var(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"tab_id":"w9:t9","focused_pane_cwd":"/Users/u/topscan","focused_pane_agent":"opencode"}"#,
+        );
+        std::env::remove_var("HERDR_PLUGIN_EVENT_JSON");
+        assert_eq!(track_event(), 0);
+        assert_eq!(state::load_touched("w9:t9"), vec!["/Users/u/topscan"]);
+
+        std::env::set_var(
+            "HERDR_PLUGIN_CONTEXT_JSON",
+            r#"{"tab_id":"w9:t9","focused_pane_cwd":"/tmp","focused_pane_agent":""}"#,
+        );
+        assert_eq!(track_event(), 0);
+        assert_eq!(state::load_touched("w9:t9"), vec!["/Users/u/topscan"]);
+
+        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

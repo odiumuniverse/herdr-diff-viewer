@@ -22,6 +22,12 @@ fn git(top: &str, args: &[&str]) -> Result<(bool, String), String> {
     ))
 }
 
+pub fn canonical(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.trim_end_matches('/').to_string())
+}
+
 pub fn toplevel(cwd: &str) -> Result<String, String> {
     let (ok, out) = git(cwd, &["rev-parse", "--show-toplevel"])?;
     if !ok {
@@ -29,7 +35,7 @@ pub fn toplevel(cwd: &str) -> Result<String, String> {
             "{cwd} is not inside a git repo — open the viewer from an agent pane"
         ));
     }
-    Ok(out.trim().to_string())
+    Ok(canonical(out.trim()))
 }
 
 pub fn status(top: &str) -> Result<Vec<StatusEntry>, String> {

@@ -11,6 +11,7 @@ pub struct Palette {
     pub del_fg: Rgb,
     pub active_bg: Rgb,
     pub sel_bg: Rgb,
+    pub transparent: bool,
 }
 
 pub const DARK: Palette = Palette {
@@ -24,6 +25,21 @@ pub const DARK: Palette = Palette {
     del_fg: (255, 107, 128),
     active_bg: (58, 58, 58),
     sel_bg: (38, 79, 120),
+    transparent: false,
+};
+
+pub const TRANSPARENT_DARK: Palette = Palette {
+    bg: (38, 38, 38),
+    fg: (232, 232, 232),
+    dim: (140, 140, 140),
+    sep: (170, 170, 170),
+    add_bg: (18, 84, 38),
+    del_bg: (112, 22, 30),
+    add_fg: (74, 222, 128),
+    del_fg: (255, 80, 80),
+    active_bg: (58, 58, 58),
+    sel_bg: (38, 79, 120),
+    transparent: true,
 };
 
 pub const LIGHT: Palette = Palette {
@@ -37,7 +53,18 @@ pub const LIGHT: Palette = Palette {
     del_fg: (200, 40, 60),
     active_bg: (222, 222, 222),
     sel_bg: (173, 214, 255),
+    transparent: false,
 };
+
+use crate::hl::ThemeId;
+
+pub fn for_theme(id: ThemeId) -> &'static Palette {
+    if id == ThemeId::Transparent {
+        &TRANSPARENT_DARK
+    } else {
+        for_dark(id.is_dark())
+    }
+}
 
 pub fn for_dark(dark: bool) -> &'static Palette {
     if dark {

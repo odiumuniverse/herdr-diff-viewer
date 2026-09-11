@@ -4,8 +4,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use crate::herdr_cli;
+use crate::git;
 use crate::hl::{self, ThemeId};
 use crate::model::{self, Snapshot};
+use crate::state;
 use crate::palette::{self, Palette};
 use crate::render::{self, Body, Frame, Target};
 use crate::screen::Line;
@@ -84,6 +86,7 @@ pub enum Msg {
     Byte(u8),
     InputClosed,
     Snap(Result<Snapshot, String>),
+    Size(usize, usize),
     Gone,
 }
 
@@ -91,6 +94,8 @@ pub enum Ev {
     Quit,
     Refresh,
     ToggleGroup,
+    ThemeMenu,
+    Enter,
     Scroll(i16),
     Top,
     Bottom,
@@ -212,6 +217,8 @@ fn parse(b: u8, r: &mut Reader) -> Ev {
             b'q' | 0x03 => Ev::Quit,
             b'r' => Ev::Refresh,
             b't' => Ev::ToggleGroup,
+            b'T' => Ev::ThemeMenu,
+            b'\r' | b'\n' => Ev::Enter,
             b'j' => Ev::Scroll(1),
             b'k' => Ev::Scroll(-1),
             b'g' => Ev::Top,
@@ -258,6 +265,11 @@ enum Job {
     Text(String),
 }
 
+enum Force {
+    Refresh,
+    Theme(ThemeId),
+}
+
 enum Flow {
     Idle,
     Redraw,
@@ -266,6 +278,10 @@ enum Flow {
 
 struct App {
     pal: &'static Palette,
+    theme: ThemeId,
+    menu: Option<ThemeMenu>,
+    tty_size: (usize, usize),
+    lay_size: Option<(usize, usize)>,
     jobs: Sender<Job>,
     snap: Snapshot,
     body: Option<(Body, usize, u64)>,
@@ -278,10 +294,15 @@ struct App {
     cur: Option<(usize, usize)>,
     pending_anchor: Option<(String, u32)>,
     last_active: Option<usize>,
-    size: (usize, usize),
     grab: bool,
     grab_until: Instant,
     refocus_at: Option<Instant>,
+}
+
+struct ThemeMenu {
+    items: Vec<ThemeId>,
+    sel: usize,
+    off: usize,
 }
 
 impl App {
@@ -289,6 +310,11 @@ impl App {
         let Ok(snap) = res else {
             return;
         };
+        if snap.theme != self.theme {
+            self.theme = snap.theme;
+            self.pal = palette::for_theme(snap.theme);
+            self.gen += 1;
+        }
         if self.pending_anchor.is_none() {
             self.pending_anchor = self
                 .body
@@ -301,8 +327,15 @@ impl App {
         self.gen += 1;
     }
 
+    fn effective(&self) -> (usize, usize) {
+        match self.lay_size {
+            Some((r, c)) => (self.tty_size.0.min(r), self.tty_size.1.min(c)),
+            None => self.tty_size,
+        }
+    }
+
     fn draw(&mut self) -> Frame {
-        let (h, w) = self.size;
+        let (h, w) = self.effective();
         let stale = self
             .body
             .as_ref()
@@ -345,8 +378,14 @@ impl App {
             hover: self.hover,
             sel: self.anchor.zip(self.cur),
             pal: self.pal,
+            menu: self.menu.as_ref().map(|m| render::MenuView {
+                items: &m.items,
+                sel: m.sel,
+                off: m.off,
+                current: self.theme,
+            }),
         });
-        paint(&frame.lines);
+        paint(&frame.lines, self.pal);
         frame
     }
 
@@ -381,12 +420,17 @@ impl App {
         self.offset = self.offset.saturating_add_signed(d as isize);
     }
 
-    fn handle(&mut self, ev: Ev, frame: Option<&Frame>, force: &Sender<()>) -> Flow {
+    fn handle(&mut self, ev: Ev, frame: Option<&Frame>, force: &Sender<Force>) -> Flow {
+        if self.menu.is_some() {
+            return self.handle_menu(ev, frame, force);
+        }
         let keyish = matches!(
             ev,
             Ev::Quit
                 | Ev::Refresh
                 | Ev::ToggleGroup
+                | Ev::ThemeMenu
+                | Ev::Enter
                 | Ev::Scroll(_)
                 | Ev::Top
                 | Ev::Bottom
@@ -398,13 +442,18 @@ impl App {
         match ev {
             Ev::Quit => Flow::Quit,
             Ev::Refresh => {
-                let _ = force.send(());
+                let _ = force.send(Force::Refresh);
                 Flow::Idle
             }
             Ev::ToggleGroup => {
                 self.toggle_group();
                 Flow::Redraw
             }
+            Ev::ThemeMenu => {
+                self.open_menu();
+                Flow::Redraw
+            }
+            Ev::Enter => Flow::Idle,
             Ev::Scroll(d) => {
                 self.scroll(d);
                 Flow::Redraw
@@ -422,7 +471,7 @@ impl App {
                 self.cur = None;
                 Flow::Redraw
             }
-            Ev::Press(row, col) => self.press(frame, row as usize, col as usize),
+            Ev::Press(row, col) => self.press(frame, row as usize, col as usize, force),
             Ev::Drag(row, col) => match frame {
                 Some(f) if self.anchor.is_some() => {
                     self.cur = Some((f.body_row_clamped(row as usize), col as usize));
@@ -457,24 +506,60 @@ impl App {
         }
     }
 
-    fn press(&mut self, frame: Option<&Frame>, row: usize, col: usize) -> Flow {
+    fn press(
+        &mut self,
+        frame: Option<&Frame>,
+        row: usize,
+        col: usize,
+        force: &Sender<Force>,
+    ) -> Flow {
         self.grab = true;
         let Some(f) = frame else {
+            self.menu = None;
             return Flow::Idle;
         };
         match f.hit(row, col) {
             Some(Target::Close) => return Flow::Quit,
+            Some(Target::ThemeBtn) => {
+                if self.menu.is_some() {
+                    self.menu = None;
+                } else {
+                    self.open_menu();
+                }
+                return Flow::Redraw;
+            }
+            Some(Target::Theme(i)) => {
+                let id = self.menu.as_ref().and_then(|m| m.items.get(i).copied());
+                self.menu = None;
+                if let Some(id) = id {
+                    self.apply_theme(id, force);
+                }
+                return Flow::Redraw;
+            }
             Some(Target::Group) => {
+                if self.menu.is_some() {
+                    self.menu = None;
+                    return Flow::Redraw;
+                }
                 self.toggle_group();
                 return Flow::Redraw;
             }
             Some(Target::File(i)) => {
+                if self.menu.is_some() {
+                    self.menu = None;
+                    return Flow::Redraw;
+                }
                 if let Some(start) = self.body.as_ref().map(|b| b.0.start_of(i)) {
                     self.offset = start;
                 }
                 return Flow::Redraw;
             }
-            None => {}
+            None => {
+                if self.menu.is_some() {
+                    self.menu = None;
+                    return Flow::Redraw;
+                }
+            }
         }
         if let Some(r) = f.body_row(row) {
             self.anchor = Some((r, col));
@@ -493,13 +578,123 @@ impl App {
         self.cur = None;
         self.refocus();
     }
+
+    fn handle_menu(&mut self, ev: Ev, frame: Option<&Frame>, force: &Sender<Force>) -> Flow {
+        match ev {
+            Ev::Quit => Flow::Quit,
+            Ev::Esc | Ev::ThemeMenu => {
+                self.menu = None;
+                Flow::Redraw
+            }
+            Ev::Enter => {
+                self.select_menu(force);
+                Flow::Redraw
+            }
+            Ev::Scroll(d) => {
+                self.menu_move(d as isize);
+                Flow::Redraw
+            }
+            Ev::Top => {
+                self.menu_move_to(0);
+                Flow::Redraw
+            }
+            Ev::Bottom => {
+                self.menu_move_to(usize::MAX);
+                Flow::Redraw
+            }
+            Ev::Press(row, col) => self.press(frame, row as usize, col as usize, force),
+            Ev::Release(..) => Flow::Redraw,
+            Ev::Move(row, col) => {
+                let h = frame.and_then(|f| f.hit(row as usize, col as usize));
+                if h == self.hover {
+                    Flow::Idle
+                } else {
+                    self.hover = h;
+                    Flow::Redraw
+                }
+            }
+            Ev::Wheel(d, _) => {
+                self.menu_move(d as isize);
+                Flow::Redraw
+            }
+            _ => {
+                self.menu = None;
+                Flow::Redraw
+            }
+        }
+    }
+
+    fn open_menu(&mut self) {
+        let items: Vec<ThemeId> = ThemeId::all()
+            .into_iter()
+            .filter(|t| t.is_dark() == self.theme.is_dark())
+            .collect();
+        let sel = items.iter().position(|t| *t == self.theme).unwrap_or(0);
+        self.menu = Some(ThemeMenu { items, sel, off: 0 });
+        let vis = self.menu_visible().max(1);
+        if let Some(m) = &mut self.menu {
+            m.off = sel.saturating_sub(vis.saturating_sub(1));
+        }
+    }
+
+    fn menu_visible(&self) -> usize {
+        match &self.body {
+            Some(b) => {
+                let ents = render::entries(&self.snap, self.show_session);
+                render::geometry(ents.len(), &b.0, self.effective().0, self.offset)
+                    .body_h
+                    .saturating_sub(2)
+            }
+            None => 8,
+        }
+    }
+
+    fn menu_move(&mut self, d: isize) {
+        let (len, sel) = match &self.menu {
+            Some(m) => (m.items.len(), m.sel),
+            None => return,
+        };
+        self.menu_move_to(sel.saturating_add_signed(d).min(len.saturating_sub(1)));
+    }
+
+    fn menu_move_to(&mut self, sel: usize) {
+        let vis = self.menu_visible().max(1);
+        let Some(m) = &mut self.menu else { return };
+        m.sel = sel.min(m.items.len().saturating_sub(1));
+        if m.sel < m.off {
+            m.off = m.sel;
+        } else if m.sel >= m.off + vis {
+            m.off = m.sel + 1 - vis;
+        }
+    }
+
+    fn select_menu(&mut self, force: &Sender<Force>) {
+        let id = self.menu.as_ref().and_then(|m| m.items.get(m.sel).copied());
+        self.menu = None;
+        if let Some(id) = id {
+            self.apply_theme(id, force);
+        }
+    }
+
+    fn apply_theme(&mut self, id: ThemeId, force: &Sender<Force>) {
+        let _ = state::save_theme(id.name());
+        self.pending_anchor = self
+            .body
+            .as_ref()
+            .and_then(|b| render::anchor(&b.0, self.offset));
+        self.theme = id;
+        self.pal = palette::for_theme(id);
+        self.gen += 1;
+        let _ = force.send(Force::Theme(id));
+    }
 }
 
-fn paint(lines: &[Line]) {
+fn paint(lines: &[Line], pal: &Palette) {
     let mut s = String::from("\x1b[?2026h");
+    let default_bg = pal.transparent.then_some(pal.bg);
     for (i, l) in lines.iter().enumerate() {
         s.push_str(&format!("\x1b[{};1H", i + 1));
-        l.encode(&mut s);
+        l.encode(&mut s, default_bg);
     }
     s.push_str("\x1b[?2026l");
     let mut o = std::io::stdout();
@@ -543,38 +738,98 @@ fn spawn_worker(agent: String, me: Option<String>, _tx: Sender<Msg>) -> Sender<J
     jobs
 }
 
+const RESCAN_EVERY: u32 = 10;
+
 fn spawn_refresher(
     root: String,
     agent: String,
     theme: ThemeId,
     tx: Sender<Msg>,
-    force: Receiver<()>,
+    force: Receiver<Force>,
+    tab: String,
+    me: Option<String>,
 ) {
     std::thread::spawn(move || {
-        let theme = hl::theme(theme);
+        let mut theme_id = theme;
+        let mut theme = hl::theme(theme);
+        let mut touched = state::load_touched(&tab);
+        let mut scope: Option<model::Scope> = None;
         let mut last: Option<u64> = None;
         let mut misses = 0;
         let mut forced = true;
+        let mut ticks: u32 = 0;
         loop {
-            if !herdr_cli::pane_alive(&agent) {
-                misses += 1;
-                if misses >= 2 {
-                    let _ = tx.send(Msg::Gone);
-                    return;
+            ticks += 1;
+            let mut scope_dirty = forced;
+            match herdr_cli::pane_cwd(&agent) {
+                Some(cwd) => {
+                    misses = 0;
+                    if let Ok(top) = git::toplevel(&cwd) {
+                        let known = scope.as_ref().is_some_and(|s| s.repos.contains(&top));
+                        if !known && !touched.contains(&top) {
+                            touched.push(top);
+                            if touched.len() > state::MAX_TOUCHED {
+                                touched.remove(0);
+                            }
+                            state::save_touched(&tab, &touched);
+                            scope_dirty = true;
+                        }
+                    }
                 }
-            } else {
-                misses = 0;
+                None => {
+                    misses += 1;
+                    if misses >= 2 {
+                        let _ = tx.send(Msg::Gone);
+                        return;
+                    }
+                }
             }
-            let sig = model::signature(&root);
-            if forced || last != Some(sig) {
-                last = Some(sig);
-                let res = model::detect(&root).and_then(|s| model::build(&s, &theme));
-                if tx.send(Msg::Snap(res)).is_err() {
-                    return;
+            if scope_dirty || scope.is_none() || ticks % RESCAN_EVERY == 0 {
+                match model::detect(&root, &touched) {
+                    Ok(s) => scope = Some(s),
+                    Err(e) => {
+                        if scope.is_none() {
+                            let _ = tx.send(Msg::Snap(Err(e)));
+                        }
+                    }
+                }
+            }
+            if let Some(id) = state::load_theme().and_then(|n| hl::named(&n)) {
+                if id != theme_id {
+                    theme_id = id;
+                    theme = hl::theme(id);
+                    last = None;
+                }
+            }
+            if ticks % 2 == 0 {
+                if let Some(me) = &me {
+                    if let Ok(out) = herdr_cli::run(&["pane", "layout", "--pane", me]) {
+                        if let Some((rows, cols)) = herdr_cli::pane_rect(&out, me) {
+                            let _ = tx.send(Msg::Size(rows, cols));
+                        }
+                    }
+                }
+            }
+            if let Some(s) = &scope {
+                let sig = model::signature(&s.repos);
+                if forced || last != Some(sig) {
+                    last = Some(sig);
+                    let res = model::build(s, &theme);
+                    if tx.send(Msg::Snap(res)).is_err() {
+                        return;
+                    }
                 }
             }
             forced = match force.recv_timeout(TICK) {
-                Ok(()) => true,
+                Ok(Force::Refresh) => true,
+                Ok(Force::Theme(id)) => {
+                    if id != theme_id {
+                        theme_id = id;
+                        theme = hl::theme(id);
+                        last = None;
+                    }
+                    true
+                }
                 Err(RecvTimeoutError::Timeout) => false,
                 Err(RecvTimeoutError::Disconnected) => return,
             };
@@ -582,11 +837,15 @@ fn spawn_refresher(
     });
 }
 
-pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
-    if let Err(e) = model::detect(root) {
-        eprintln!("diff-viewer: {e}");
-        return 1;
-    }
+pub fn run_viewer(agent: &str, root: &str, me: Option<String>, tab: &str) -> i32 {
+    let touched = state::load_touched(tab);
+    let scope = match model::detect(root, &touched) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("diff-viewer: {e}");
+            return 1;
+        }
+    };
     let tty = match open_ctty() {
         Ok(t) => t,
         Err(e) => {
@@ -595,6 +854,20 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
         }
     };
     let theme = hl::resolve_ctty(&tty);
+    let snap = model::build(&scope, &theme).unwrap_or_else(|_| Snapshot {
+        main: Vec::new(),
+        session: Vec::new(),
+        files: 0,
+        adds: 0,
+        dels: 0,
+        repos: scope.repos.len(),
+        theme: theme.id,
+    });
+    let lay = me.as_ref().and_then(|me| {
+        herdr_cli::run(&["pane", "layout", "--pane", me])
+            .ok()
+            .and_then(|out| herdr_cli::pane_rect(&out, me))
+    });
     let term = match Term::enter(tty) {
         Ok(t) => t,
         Err(e) => {
@@ -613,8 +886,8 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
     let (tx, rx) = mpsc::channel();
     spawn_input(input, tx.clone());
     let (force_tx, force_rx) = mpsc::channel();
-    let jobs = spawn_worker(agent.to_string(), me, tx.clone());
-    spawn_refresher(root.to_string(), agent.to_string(), theme.id, tx, force_rx);
+    let jobs = spawn_worker(agent.to_string(), me.clone(), tx.clone());
+    spawn_refresher(root.to_string(), agent.to_string(), theme.id, tx, force_rx, tab.to_string(), me);
 
     let mut r = Reader {
         rx,
@@ -622,15 +895,13 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
         pushback: Vec::new(),
     };
     let mut app = App {
-        pal: palette::for_dark(theme.id.is_dark()),
+        pal: palette::for_theme(theme.id),
+        theme: theme.id,
+        menu: None,
+        tty_size: size(&term.tty),
+        lay_size: lay,
         jobs,
-        snap: Snapshot {
-            main: Vec::new(),
-            session: Vec::new(),
-            files: 0,
-            adds: 0,
-            dels: 0,
-        },
+        snap,
         body: None,
         gen: 0,
         offset: 0,
@@ -641,7 +912,6 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
         cur: None,
         pending_anchor: None,
         last_active: None,
-        size: size(&term.tty),
         grab: false,
         grab_until: Instant::now(),
         refocus_at: None,
@@ -662,9 +932,12 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
         if size_checked.elapsed() >= SIZE_POLL {
             size_checked = Instant::now();
             let s = size(&term.tty);
-            if s != app.size {
-                app.size = s;
-                dirty = true;
+            if s != app.tty_size {
+                let before = app.effective();
+                app.tty_size = s;
+                if app.effective() != before {
+                    dirty = true;
+                }
             }
         }
         if app.refocus_at.is_some_and(|t| Instant::now() >= t) {
@@ -676,6 +949,13 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
             Some(Msg::Snap(res)) => {
                 app.apply(res);
                 dirty = true;
+            }
+            Some(Msg::Size(rows, cols)) => {
+                let before = app.effective();
+                app.lay_size = Some((rows.max(10), cols.max(40)));
+                if app.effective() != before {
+                    dirty = true;
+                }
             }
             Some(Msg::Byte(b)) => {
                 if b != 0x1b && app.grabbed() {
@@ -740,6 +1020,8 @@ mod tests {
     fn lone_escape_and_keys() {
         assert!(matches!(ev(b"\x1b"), Ev::Esc));
         assert!(matches!(ev(b"q"), Ev::Quit));
+        assert!(matches!(ev(b"T"), Ev::ThemeMenu));
+        assert!(matches!(ev(b"\r"), Ev::Enter));
         assert!(matches!(ev(b"\x1b[6~"), Ev::Scroll(20)));
     }
 
@@ -748,5 +1030,79 @@ mod tests {
         assert_eq!(parse_sgr("<0;10;20", b'M').unwrap(), (0, 10, 20));
         assert!(parse_sgr("<0;10;20", b'A').is_none());
         assert!(parse_sgr("0;10;20", b'M').is_none());
+    }
+
+    fn test_app() -> (App, Sender<Force>, Receiver<Force>) {
+        let (jobs, _dropped) = mpsc::channel();
+        let (force_tx, force_rx) = mpsc::channel();
+        let app = App {
+            pal: palette::for_dark(true),
+            theme: ThemeId::ClaudeDark,
+            menu: None,
+            tty_size: (30, 100),
+            lay_size: None,
+            jobs,
+            snap: Snapshot {
+                main: Vec::new(),
+                session: Vec::new(),
+                files: 0,
+                adds: 0,
+                dels: 0,
+                repos: 0,
+                theme: ThemeId::ClaudeDark,
+            },
+            body: None,
+            gen: 0,
+            offset: 0,
+            list_off: 0,
+            show_session: false,
+            hover: None,
+            anchor: None,
+            cur: None,
+            pending_anchor: None,
+            last_active: None,
+            grab: false,
+            grab_until: Instant::now(),
+            refocus_at: None,
+        };
+        (app, force_tx, force_rx)
+    }
+
+    #[test]
+    fn theme_menu_select_applies_persists_and_notifies() {
+        let dir = std::env::temp_dir().join(format!("dv-menu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("DIFF_VIEWER_CONFIG_DIR", &dir);
+        let (mut app, force_tx, force_rx) = test_app();
+        app.open_menu();
+        let n = app.menu.as_ref().unwrap().items.len();
+        assert!(n > 1);
+        assert!(app.menu.as_ref().unwrap().items.iter().all(|t| t.is_dark()));
+        app.menu_move(1000);
+        assert_eq!(app.menu.as_ref().unwrap().sel, n - 1);
+        app.menu_move(-1000);
+        assert_eq!(app.menu.as_ref().unwrap().sel, 0);
+        app.menu_move(1);
+        app.select_menu(&force_tx);
+        assert!(app.menu.is_none());
+        assert_eq!(app.theme, ThemeId::ViewerDark);
+        assert_eq!(app.pal.bg, crate::palette::DARK.bg);
+        assert_eq!(crate::state::load_theme().as_deref(), Some("diff-viewer"));
+        assert!(matches!(force_rx.try_recv(), Ok(Force::Theme(ThemeId::ViewerDark))));
+        crate::state::clear_theme();
+        assert!(crate::state::load_theme().is_none());
+        std::env::remove_var("DIFF_VIEWER_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_size_is_min_of_tty_and_layout() {
+        let (mut app, _, _) = test_app();
+        assert_eq!(app.effective(), (30, 100));
+        app.lay_size = Some((58, 94));
+        assert_eq!(app.effective(), (30, 94));
+        app.lay_size = Some((20, 200));
+        assert_eq!(app.effective(), (20, 100));
     }
 }
