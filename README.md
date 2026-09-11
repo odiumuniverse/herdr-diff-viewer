@@ -1,8 +1,16 @@
 # diff-viewer
 
+[![CI](https://github.com/odiumuniverse/herdr-diff-viewer/actions/workflows/ci.yml/badge.svg)](https://github.com/odiumuniverse/herdr-diff-viewer/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macos%20%7C%20linux-lightgrey)
+![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)
+![Themes](https://img.shields.io/badge/themes-23-blueviolet)
+
 > ✨ Beautiful and ⚡ BLAZINGLY FAST ✨
 
 Git diff sidebar for [herdr](https://github.com): changed files with red/green hunks in a split pane. Click a file to jump, drag to send lines into the agent prompt. Written in Rust 🦀 btw.
+
+![diff-viewer screenshot](assets/screenshot.png)
 
 ## Usage
 
