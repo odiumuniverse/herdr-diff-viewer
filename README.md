@@ -4,9 +4,7 @@ Git diff sidebar for [herdr](https://github.com): changed files with red/green h
 
 ## Usage
 
-Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`). Shows `git status` changes of the pane's repo (untracked included); `t` collapses tests/generated.
-
-Keys: `q` quit · `r` refresh · `t` tests · `j/k`, arrows, wheel scroll · `g/G` top/bottom · drag sends `file:line` + text to the agent.
+Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`). Shows `git status` changes of the pane's repo, untracked files included.
 
 ## Theme
 

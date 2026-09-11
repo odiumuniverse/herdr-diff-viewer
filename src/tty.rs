@@ -83,8 +83,7 @@ pub fn size(tty: &std::fs::File) -> (usize, usize) {
 pub enum Msg {
     Byte(u8),
     InputClosed,
-    Snap(Result<(Snapshot, String), String>),
-    Note(String),
+    Snap(Result<Snapshot, String>),
     Gone,
 }
 
@@ -279,7 +278,6 @@ struct App {
     cur: Option<(usize, usize)>,
     pending_anchor: Option<(String, u32)>,
     last_active: Option<usize>,
-    msg: String,
     size: (usize, usize),
     grab: bool,
     grab_until: Instant,
@@ -287,26 +285,20 @@ struct App {
 }
 
 impl App {
-    fn apply(&mut self, res: Result<(Snapshot, String), String>) {
-        match res {
-            Ok((snap, note)) => {
-                if self.pending_anchor.is_none() {
-                    self.pending_anchor = self
-                        .body
-                        .as_ref()
-                        .and_then(|b| render::anchor(&b.0, self.offset));
-                }
-                self.msg = format!(
-                    "{} files +{} -{} · {note}",
-                    snap.files, snap.adds, snap.dels
-                );
-                self.snap = snap;
-                self.anchor = None;
-                self.cur = None;
-                self.gen += 1;
-            }
-            Err(e) => self.msg = e,
+    fn apply(&mut self, res: Result<Snapshot, String>) {
+        let Ok(snap) = res else {
+            return;
+        };
+        if self.pending_anchor.is_none() {
+            self.pending_anchor = self
+                .body
+                .as_ref()
+                .and_then(|b| render::anchor(&b.0, self.offset));
         }
+        self.snap = snap;
+        self.anchor = None;
+        self.cur = None;
+        self.gen += 1;
     }
 
     fn draw(&mut self) -> Frame {
@@ -342,7 +334,6 @@ impl App {
             }
         }
         self.list_off = self.list_off.min(ents.len().saturating_sub(geo.list_h));
-        let footer = self.msg.clone();
         let frame = render::frame(&render::View {
             snap: &self.snap,
             body,
@@ -353,7 +344,6 @@ impl App {
             list_off: self.list_off,
             hover: self.hover,
             sel: self.anchor.zip(self.cur),
-            msg: &footer,
             pal: self.pal,
         });
         paint(&frame.lines);
@@ -497,7 +487,6 @@ impl App {
         if let (Some(a), Some(f), Some(b)) = (self.anchor.take(), frame, self.body.as_ref()) {
             let end = (f.body_row_clamped(row), col);
             if let Some(p) = render::selection_payload(&b.0, a, end) {
-                self.msg = format!("sent {} lines to agent", p.lines().count());
                 let _ = self.jobs.send(Job::Text(p));
             }
         }
@@ -539,16 +528,14 @@ fn spawn_input(mut tty: std::fs::File, tx: Sender<Msg>) {
     });
 }
 
-fn spawn_worker(agent: String, me: Option<String>, tx: Sender<Msg>) -> Sender<Job> {
+fn spawn_worker(agent: String, me: Option<String>, _tx: Sender<Msg>) -> Sender<Job> {
     let (jobs, rx) = mpsc::channel::<Job>();
     std::thread::spawn(move || {
         for job in rx {
             match job {
                 Job::Focus => herdr_cli::focus_agent(&agent, me.as_deref()),
                 Job::Text(t) => {
-                    if let Err(e) = herdr_cli::send_text(&agent, &t) {
-                        let _ = tx.send(Msg::Note(format!("send failed: {e}")));
-                    }
+                    let _ = herdr_cli::send_text(&agent, &t);
                 }
             }
         }
@@ -581,9 +568,7 @@ fn spawn_refresher(
             let sig = model::signature(&root);
             if forced || last != Some(sig) {
                 last = Some(sig);
-                let res = model::detect(&root)
-                    .and_then(|s| model::build(&s, &theme))
-                    .map(|snap| (snap, "git changes".to_string()));
+                let res = model::detect(&root).and_then(|s| model::build(&s, &theme));
                 if tx.send(Msg::Snap(res)).is_err() {
                     return;
                 }
@@ -656,7 +641,6 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
         cur: None,
         pending_anchor: None,
         last_active: None,
-        msg: "loading…".to_string(),
         size: size(&term.tty),
         grab: false,
         grab_until: Instant::now(),
@@ -691,10 +675,6 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
             Some(Msg::InputClosed) | Some(Msg::Gone) => return 0,
             Some(Msg::Snap(res)) => {
                 app.apply(res);
-                dirty = true;
-            }
-            Some(Msg::Note(n)) => {
-                app.msg = n;
                 dirty = true;
             }
             Some(Msg::Byte(b)) => {

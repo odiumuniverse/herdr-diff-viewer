@@ -118,7 +118,6 @@ pub struct View<'a> {
     pub list_off: usize,
     pub hover: Option<Target>,
     pub sel: Option<((usize, usize), (usize, usize))>,
-    pub msg: &'a str,
     pub pal: &'a Palette,
 }
 
@@ -150,7 +149,7 @@ pub fn entry_pos(entries: &[Entry], file: usize) -> Option<usize> {
 pub fn geometry(entries: usize, body: &Body, height: usize, offset: usize) -> Geometry {
     let list_h = entries.min((height.saturating_sub(FIXED_ROWS) / 3).max(1));
     let body_top = LIST_TOP + list_h + 4;
-    let body_h = height.saturating_sub(body_top + 1);
+    let body_h = height.saturating_sub(body_top);
     let active = body.rows.get(offset).map(|r| r.file());
     let mut body_start = offset;
     if let Some(f) = active {
@@ -428,9 +427,6 @@ pub fn frame(v: &View) -> Frame {
         lines.push(l);
     }
 
-    let mut foot = Line::blank(w, dim);
-    foot.put(PAD, &trunc(v.msg, w.saturating_sub(2 * PAD)), dim);
-    lines.push(foot);
     Frame { lines, hits, geo }
 }
 
@@ -575,7 +571,6 @@ mod tests {
             list_off: 0,
             hover,
             sel: None,
-            msg: "",
             pal: &DARK,
         }
     }
