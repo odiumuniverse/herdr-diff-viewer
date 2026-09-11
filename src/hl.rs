@@ -170,32 +170,31 @@ pub struct Theme {
 }
 
 static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
-static QUERIED_LIGHT: OnceLock<Option<bool>> = OnceLock::new();
 
 fn syntaxes() -> &'static SyntaxSet {
     SYNTAXES.get_or_init(SyntaxSet::load_defaults_nonewlines)
 }
 
-pub fn resolve() -> Theme {
+pub fn resolve_ctty(tty: &std::fs::File) -> Theme {
     let id = match std::env::var("DIFF_THEME").ok().as_deref() {
         Some("dark") => ThemeId::ClaudeDark,
         Some("light") => ThemeId::ClaudeLight,
-        Some(name) => ThemeId::from_name(name).unwrap_or_else(default_id),
-        None => default_id(),
+        Some(name) => ThemeId::from_name(name).unwrap_or_else(|| default_ctty(tty)),
+        None => default_ctty(tty),
     };
     Theme { id, syn: load(id) }
 }
 
-fn default_id() -> ThemeId {
-    if queried_light() {
+fn default_ctty(tty: &std::fs::File) -> ThemeId {
+    if query_ctty(tty).unwrap_or(false) {
         ThemeId::ClaudeLight
     } else {
         ThemeId::ClaudeDark
     }
 }
 
-fn queried_light() -> bool {
-    (*QUERIED_LIGHT.get_or_init(query_terminal)).unwrap_or(false)
+pub fn theme(id: ThemeId) -> Theme {
+    Theme { id, syn: load(id) }
 }
 
 fn load(id: ThemeId) -> SynTheme {
@@ -210,29 +209,38 @@ fn load(id: ThemeId) -> SynTheme {
     }
 }
 
-fn query_terminal() -> Option<bool> {
+fn query_ctty(tty: &std::fs::File) -> Option<bool> {
     use std::io::{Read, Write};
     let set = |a: &[&str]| {
         std::process::Command::new("stty")
             .args(a)
+            .stdin(tty.try_clone().ok()?)
             .status()
             .ok()
             .filter(|s| s.success())
     };
     let saved = std::process::Command::new("stty")
         .arg("-g")
+        .stdin(tty.try_clone().ok()?)
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())?;
     set(&["-echo", "-icanon"])?;
-    set(&["min", "0", "time", "1"])?;
+    let restore = |saved: &str| {
+        let args: Vec<&str> = saved.split_whitespace().collect();
+        let _ = set(&args);
+    };
+    if set(&["min", "0", "time", "1"]).is_none() {
+        restore(&saved);
+        return None;
+    }
     let _ = write!(std::io::stdout(), "\x1b]11;?\x1b\\");
     let _ = std::io::stdout().flush();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 64];
-    let mut stdin = std::io::stdin();
+    let mut tty_in = tty.try_clone().ok()?;
     for _ in 0..8 {
-        match stdin.read(&mut tmp) {
+        match tty_in.read(&mut tmp) {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
@@ -262,14 +270,6 @@ pub fn parse_bg(reply: &str) -> Option<bool> {
         comp(parts.next())?,
     );
     Some(0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5)
-}
-
-pub fn row_bg(dark: bool) -> (&'static str, &'static str) {
-    if dark {
-        ("\x1b[48;5;22m", "\x1b[48;5;52m")
-    } else {
-        ("\x1b[48;5;194m", "\x1b[48;5;224m")
-    }
 }
 
 pub fn highlight(path: &str, lines: &[String], theme: &Theme) -> Vec<Vec<Span>> {

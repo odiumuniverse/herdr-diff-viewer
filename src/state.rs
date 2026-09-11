@@ -40,6 +40,47 @@ pub fn remove(tab: &str) {
     let _ = fs::remove_file(state_path(tab));
 }
 
+const LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub struct Lock {
+    path: PathBuf,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lock_path(tab: &str) -> PathBuf {
+    state_path(tab).with_extension("lock")
+}
+
+fn claim(path: PathBuf) -> Option<Lock> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()
+        .map(|_| Lock { path })
+}
+
+pub fn lock(tab: &str) -> Option<Lock> {
+    let path = lock_path(tab);
+    if let Some(l) = claim(path.clone()) {
+        return Some(l);
+    }
+    let stale = fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().is_ok_and(|age| age > LOCK_STALE))
+        .unwrap_or(true);
+    if !stale {
+        return None;
+    }
+    let _ = fs::remove_file(&path);
+    claim(path)
+}
+
 fn esc(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
@@ -67,5 +108,16 @@ mod tests {
         assert_eq!(back.repo, "/tmp/repo");
         remove(tab);
         assert!(load(tab).is_none());
+    }
+
+    #[test]
+    fn lock_is_exclusive_until_dropped() {
+        let tab = "test_tab_lock_xyz";
+        let _ = fs::remove_file(lock_path(tab));
+        let first = lock(tab).expect("first lock");
+        assert!(lock(tab).is_none(), "second toggle must not open a viewer");
+        drop(first);
+        assert!(lock(tab).is_some(), "lock must release on drop");
+        let _ = fs::remove_file(lock_path(tab));
     }
 }

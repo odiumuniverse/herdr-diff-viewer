@@ -4,8 +4,9 @@ mod group;
 mod herdr_cli;
 mod hl;
 mod model;
+mod palette;
 mod render;
-mod session;
+mod screen;
 mod state;
 mod tty;
 
@@ -32,6 +33,9 @@ fn toggle() -> i32 {
             return 1;
         }
     };
+    let Some(_lock) = state::lock(&ctx.tab) else {
+        return 0;
+    };
     if let Some(st) = state::load(&ctx.tab) {
         if herdr_cli::pane_alive(&st.viewer_pane) {
             let _ = herdr_cli::close_pane(&st.viewer_pane);
@@ -47,23 +51,19 @@ fn toggle() -> i32 {
             return 1;
         }
     };
-    match herdr_cli::pane_id_after(&out, "\"plugin_pane\"") {
-        Some(id) => {
-            let _ = state::save(
-                &ctx.tab,
-                &state::ToggleState {
-                    viewer_pane: id,
-                    agent_pane: ctx.agent_pane,
-                    repo: ctx.cwd,
-                },
-            );
-            0
-        }
-        None => {
-            eprintln!("diff-viewer: could not find new pane id in: {}", out.trim());
-            1
-        }
-    }
+    let Some(id) = herdr_cli::pane_id_after(&out, "\"plugin_pane\"") else {
+        eprintln!("diff-viewer: could not find new pane id in: {}", out.trim());
+        return 1;
+    };
+    let _ = state::save(
+        &ctx.tab,
+        &state::ToggleState {
+            viewer_pane: id,
+            agent_pane: ctx.agent_pane,
+            repo: ctx.cwd,
+        },
+    );
+    0
 }
 
 fn themes() -> i32 {
@@ -102,5 +102,15 @@ fn viewer() -> i32 {
         eprintln!("diff-viewer: {repo_src} is gone — reopen via the toggle action");
         return 1;
     }
-    tty::run_viewer(&agent, &repo_src)
+    let me = env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|p| !p.is_empty() && *p != agent);
+    let code = tty::run_viewer(&agent, &repo_src, me.clone());
+    if code == 0 {
+        if let Some(me) = me {
+            state::remove(&tab);
+            let _ = herdr_cli::close_pane(&me);
+        }
+    }
+    code
 }

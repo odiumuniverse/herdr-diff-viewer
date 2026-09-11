@@ -1,3 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use crate::git::{self, DiffLine};
 use crate::group::{classify, Group};
 use crate::hl::{self, Span};
@@ -5,7 +8,6 @@ use crate::hl::{self, Span};
 pub struct FileView {
     pub path: String,
     pub display: String,
-    pub abs: String,
     pub adds: u32,
     pub dels: u32,
     pub group: Group,
@@ -39,17 +41,17 @@ pub fn detect(root: &str) -> Result<Scope, String> {
     Ok(Scope::Multi(root.to_string(), repos))
 }
 
-pub fn build(scope: &Scope) -> Result<Snapshot, String> {
+pub fn build(scope: &Scope, theme: &hl::Theme) -> Result<Snapshot, String> {
     match scope {
         Scope::Single(top) => {
-            let (main, session) = build_one(top)?;
+            let (main, session) = build_one(top, theme)?;
             Ok(finish(main, session))
         }
         Scope::Multi(root, repos) => {
             let mut main = Vec::new();
             let mut session = Vec::new();
             for r in repos {
-                let (mut m, mut s) = build_one(&format!("{root}/{r}"))?;
+                let (mut m, mut s) = build_one(&format!("{root}/{r}"), theme)?;
                 for f in m.iter_mut().chain(s.iter_mut()) {
                     f.display = format!("{r}/{}", f.path);
                 }
@@ -59,6 +61,29 @@ pub fn build(scope: &Scope) -> Result<Snapshot, String> {
             Ok(finish(main, session))
         }
     }
+}
+
+pub fn signature(root: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    let tops = match detect(root) {
+        Ok(Scope::Single(top)) => vec![top],
+        Ok(Scope::Multi(root, repos)) => repos.iter().map(|r| format!("{root}/{r}")).collect(),
+        Err(e) => {
+            e.hash(&mut h);
+            return h.finish();
+        }
+    };
+    for top in &tops {
+        let raw = git::status_raw(top);
+        for e in git::parse_porcelain_z(&raw) {
+            if let Ok(m) = std::fs::metadata(format!("{top}/{}", e.path)) {
+                m.len().hash(&mut h);
+                m.modified().ok().hash(&mut h);
+            }
+        }
+        raw.hash(&mut h);
+    }
+    h.finish()
 }
 
 fn finish(mut main: Vec<FileView>, mut session: Vec<FileView>) -> Snapshot {
@@ -81,26 +106,10 @@ fn totals(main: &[FileView], session: &[FileView]) -> (usize, u64, u64) {
     (files, adds, dels)
 }
 
-pub fn retain_session(snap: &mut Snapshot, touched: &[String]) {
-    let keep = |f: &FileView| {
-        let disp = format!("/{}", f.display);
-        touched
-            .iter()
-            .any(|t| t == &f.abs || t == &f.display || t.ends_with(&disp))
-    };
-    snap.main.retain(&keep);
-    snap.session.retain(&keep);
-    let (files, adds, dels) = totals(&snap.main, &snap.session);
-    snap.files = files;
-    snap.adds = adds;
-    snap.dels = dels;
-}
-
-fn build_one(top: &str) -> Result<(Vec<FileView>, Vec<FileView>), String> {
+fn build_one(top: &str, theme: &hl::Theme) -> Result<(Vec<FileView>, Vec<FileView>), String> {
     let entries = git::status(top)?;
     let stats = git::numstat(top);
     let all = git::unified_all(top);
-    let theme = hl::resolve();
     let mut main = Vec::new();
     let mut session = Vec::new();
     for e in &entries {
@@ -118,12 +127,11 @@ fn build_one(top: &str) -> Result<(Vec<FileView>, Vec<FileView>), String> {
         let file = FileView {
             display: e.path.clone(),
             path: e.path.clone(),
-            abs: format!("{top}/{}", e.path),
             adds,
             dels,
             group: classify(&e.path),
             hunks,
-            hl: hl::highlight(&e.path, &texts, &theme),
+            hl: hl::highlight(&e.path, &texts, theme),
         };
         if file.group == Group::Session {
             session.push(file);
@@ -139,27 +147,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn retain_keeps_session_files_only() {
-        let mk = |display: &str, abs: &str| FileView {
-            path: display.into(),
-            display: display.into(),
-            abs: abs.into(),
-            adds: 1,
-            dels: 0,
-            group: Group::Main,
-            hunks: vec![],
-            hl: vec![],
-        };
-        let mut snap = finish(
-            vec![
-                mk("apisrv/a.go", "/top/apisrv/a.go"),
-                mk("tpsrv/b.go", "/top/tpsrv/b.go"),
-            ],
-            vec![],
-        );
-        retain_session(&mut snap, &["/top/tpsrv/b.go".to_string()]);
-        assert_eq!(snap.files, 1);
-        assert_eq!(snap.main[0].display, "tpsrv/b.go");
-        assert_eq!(snap.adds, 1);
+    fn signature_moves_when_a_dirty_file_changes_again() {
+        let root = std::env::temp_dir().join(format!("dv-sig-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", &root_s])
+            .status()
+            .is_ok_and(|s| s.success());
+        assert!(ok, "git init failed");
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let first = signature(&root_s);
+        assert_eq!(first, signature(&root_s));
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        assert_ne!(first, signature(&root_s));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

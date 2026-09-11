@@ -43,6 +43,15 @@ pub fn status(top: &str) -> Result<Vec<StatusEntry>, String> {
     Ok(parse_porcelain_z(&out))
 }
 
+pub fn status_raw(top: &str) -> String {
+    git(
+        top,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .map(|(_, out)| out)
+    .unwrap_or_default()
+}
+
 pub fn parse_porcelain_z(out: &str) -> Vec<StatusEntry> {
     let mut entries = Vec::new();
     let mut toks = out.split('\0').peekable();

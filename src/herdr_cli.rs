@@ -64,6 +64,15 @@ pub fn send_text(pane: &str, text: &str) -> Result<(), String> {
     run(&["pane", "send-text", pane, text]).map(|_| ())
 }
 
+pub fn focus_agent(agent: &str, viewer: Option<&str>) {
+    if run(&["agent", "focus", agent]).is_ok() {
+        return;
+    }
+    if let Some(v) = viewer {
+        let _ = run(&["pane", "focus", "--direction", "left", "--pane", v]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

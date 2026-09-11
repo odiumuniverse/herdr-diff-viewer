@@ -1,51 +1,91 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::time::{Duration, Instant};
 
 use crate::herdr_cli;
+use crate::hl::{self, ThemeId};
 use crate::model::{self, Snapshot};
-use crate::render::{self, GUTTER_W};
-use crate::session::SessionRef;
+use crate::palette::{self, Palette};
+use crate::render::{self, Body, Frame, Target};
+use crate::screen::Line;
+
+const TICK: Duration = Duration::from_millis(1000);
+const SIZE_POLL: Duration = Duration::from_millis(500);
+const SEQ_WAIT: Duration = Duration::from_millis(50);
+const WHEEL_IDLE: Duration = Duration::from_millis(250);
+const GRAB_GRACE: Duration = Duration::from_millis(400);
+
+pub fn open_ctty() -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|e| format!("no controlling terminal (/dev/tty): {e}"))
+}
 
 pub struct Term {
     saved: String,
+    tty: std::fs::File,
 }
 
 impl Term {
-    pub fn enter() -> Result<Term, String> {
-        let saved = stty(&["-g"])?;
-        stty(&["-echo", "-icanon", "min", "1"])?;
+    pub fn enter(tty: std::fs::File) -> Result<Term, String> {
+        let saved = stty_on(&tty, &["-g"])?;
+        stty_on(&tty, &["-echo", "-icanon", "-isig", "min", "1"])?;
         let mut o = std::io::stdout();
-        let _ = o.write_all(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[?25l\x1b[H");
+        let _ = o.write_all(
+            b"\x1b[?1049h\x1b[?7l\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?25l\x1b[H",
+        );
         let _ = o.flush();
-        Ok(Term { saved })
+        Ok(Term { saved, tty })
     }
 }
 
 impl Drop for Term {
     fn drop(&mut self) {
         let mut o = std::io::stdout();
-        let _ = o.write_all(b"\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?1049l");
+        let _ = o
+            .write_all(b"\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1006l\x1b[?7h\x1b[?25h\x1b[?1049l");
         let _ = o.flush();
+        if self.saved.split_whitespace().next().is_none() {
+            return;
+        }
         let args: Vec<&str> = self.saved.split_whitespace().collect();
-        let _ = stty(&args);
+        let _ = stty_on(&self.tty, &args);
     }
 }
 
-fn stty(args: &[&str]) -> Result<String, String> {
+fn stty_on(tty: &std::fs::File, args: &[&str]) -> Result<String, String> {
+    let stdin = tty.try_clone().map_err(|e| format!("clone tty: {e}"))?;
     let out = std::process::Command::new("stty")
         .args(args)
+        .stdin(stdin)
         .output()
-        .map_err(|e| format!("stty failed: {e}"))?;
+        .map_err(|e| format!("spawn stty: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("stty {} failed: {}", args.join(" "), err.trim()));
+    }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn size() -> (u16, u16) {
-    let Ok(out) = stty(&["size"]) else {
+pub fn size(tty: &std::fs::File) -> (usize, usize) {
+    let Ok(out) = stty_on(tty, &["size"]) else {
         return (24, 100);
     };
     let mut it = out.split_whitespace();
-    let rows = it.next().and_then(|s| s.parse().ok()).unwrap_or(24);
-    let cols = it.next().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let rows: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(24);
+    let cols: usize = it.next().and_then(|s| s.parse().ok()).unwrap_or(100);
     (rows.max(10), cols.max(40))
+}
+
+pub enum Msg {
+    Byte(u8),
+    InputClosed,
+    Snap(Result<(Snapshot, String), String>),
+    Note(String),
+    Gone,
 }
 
 pub enum Ev {
@@ -55,9 +95,11 @@ pub enum Ev {
     Scroll(i16),
     Top,
     Bottom,
-    Click(u16, u16),
+    Press(u16, u16),
     Drag(u16, u16),
     Release(u16, u16),
+    Move(u16, u16),
+    Wheel(i16, u16),
     Esc,
     Unknown,
 }
@@ -77,52 +119,95 @@ pub fn parse_sgr(body: &str, fin: u8) -> Option<(u8, u16, u16)> {
 pub enum Mouse {
     Press,
     Drag,
+    Move,
     Release,
     WheelUp,
     WheelDown,
+    Other,
 }
 
 pub fn decode_button(cb: u8) -> Mouse {
     if cb & 64 != 0 {
-        if cb & 1 == 0 {
+        return if cb & 1 == 0 {
             Mouse::WheelUp
         } else {
             Mouse::WheelDown
-        }
-    } else if cb & 3 == 3 {
-        Mouse::Release
-    } else if cb & 32 != 0 {
-        Mouse::Drag
-    } else {
-        Mouse::Press
+        };
+    }
+    let button = cb & 3;
+    if cb & 32 != 0 {
+        return match button {
+            0 => Mouse::Drag,
+            3 => Mouse::Move,
+            _ => Mouse::Other,
+        };
+    }
+    match button {
+        0 => Mouse::Press,
+        3 => Mouse::Release,
+        _ => Mouse::Other,
     }
 }
 
-struct Reader<'a> {
-    stdin: std::io::StdinLock<'a>,
+fn mouse_ev(cb: u8, fin: u8, row: u16, col: u16) -> Ev {
+    if fin == b'm' {
+        return if cb & (3 | 64) == 0 {
+            Ev::Release(row, col)
+        } else {
+            Ev::Unknown
+        };
+    }
+    match decode_button(cb) {
+        Mouse::Press => Ev::Press(row, col),
+        Mouse::Drag => Ev::Drag(row, col),
+        Mouse::Move => Ev::Move(row, col),
+        Mouse::Release => Ev::Release(row, col),
+        Mouse::WheelUp => Ev::Wheel(-3, row),
+        Mouse::WheelDown => Ev::Wheel(3, row),
+        Mouse::Other => Ev::Unknown,
+    }
+}
+
+struct Reader {
+    rx: Receiver<Msg>,
+    stash: VecDeque<Msg>,
     pushback: Vec<u8>,
 }
 
-impl Reader<'_> {
-    fn byte(&mut self) -> Option<u8> {
+impl Reader {
+    fn next(&mut self, timeout: Duration) -> Option<Msg> {
+        if let Some(b) = self.pushback.pop() {
+            return Some(Msg::Byte(b));
+        }
+        if let Some(m) = self.stash.pop_front() {
+            return Some(m);
+        }
+        match self.rx.recv_timeout(timeout) {
+            Ok(m) => Some(m),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => Some(Msg::InputClosed),
+        }
+    }
+
+    fn byte(&mut self, timeout: Duration) -> Option<u8> {
         if let Some(b) = self.pushback.pop() {
             return Some(b);
         }
-        let mut buf = [0u8; 1];
+        let deadline = Instant::now() + timeout;
         loop {
-            match self.stdin.read_exact(&mut buf) {
-                Ok(()) => return Some(buf[0]),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
-                Err(_) => continue,
+            match self
+                .rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(Msg::Byte(b)) => return Some(b),
+                Ok(other) => self.stash.push_back(other),
+                Err(_) => return None,
             }
         }
     }
 }
 
-fn next_ev(r: &mut Reader) -> Ev {
-    let Some(b) = r.byte() else {
-        return Ev::Quit;
-    };
+fn parse(b: u8, r: &mut Reader) -> Ev {
     if b != 0x1b {
         return match b {
             b'q' | 0x03 => Ev::Quit,
@@ -136,8 +221,8 @@ fn next_ev(r: &mut Reader) -> Ev {
             _ => Ev::Unknown,
         };
     }
-    let Some(b2) = r.byte() else {
-        return Ev::Quit;
+    let Some(b2) = r.byte(SEQ_WAIT) else {
+        return Ev::Esc;
     };
     if b2 != b'[' {
         r.pushback.push(b2);
@@ -145,29 +230,20 @@ fn next_ev(r: &mut Reader) -> Ev {
     }
     let mut body = String::new();
     loop {
-        let Some(c) = r.byte() else {
-            return Ev::Quit;
+        let Some(c) = r.byte(SEQ_WAIT) else {
+            return Ev::Unknown;
         };
         if (0x40..=0x7E).contains(&c) {
             if body.starts_with('<') {
-                if let Some((cb, x, y)) = parse_sgr(&body, c) {
-                    let (row, col) = (y.saturating_sub(1), x.saturating_sub(1));
-                    if c == b'm' {
-                        return Ev::Release(row, col);
-                    }
-                    return match decode_button(cb) {
-                        Mouse::Press => Ev::Click(row, col),
-                        Mouse::Drag => Ev::Drag(row, col),
-                        Mouse::Release => Ev::Release(row, col),
-                        Mouse::WheelUp => Ev::Scroll(-3),
-                        Mouse::WheelDown => Ev::Scroll(3),
-                    };
-                }
-                return Ev::Unknown;
+                return parse_sgr(&body, c)
+                    .map(|(cb, x, y)| mouse_ev(cb, c, y.saturating_sub(1), x.saturating_sub(1)))
+                    .unwrap_or(Ev::Unknown);
             }
-            return match c {
-                b'A' => Ev::Scroll(-1),
-                b'B' => Ev::Scroll(1),
+            return match (body.as_str(), c) {
+                ("", b'A') => Ev::Scroll(-1),
+                ("", b'B') => Ev::Scroll(1),
+                ("5", b'~') => Ev::Scroll(-20),
+                ("6", b'~') => Ev::Scroll(20),
                 _ => Ev::Unknown,
             };
         }
@@ -178,121 +254,394 @@ fn next_ev(r: &mut Reader) -> Ev {
     }
 }
 
+enum Job {
+    Focus,
+    Text(String),
+}
+
+enum Flow {
+    Idle,
+    Redraw,
+    Quit,
+}
+
 struct App {
-    agent: String,
-    root: String,
-    session: Option<SessionRef>,
-    sess_cache: crate::session::SessCache,
-    theme: crate::hl::ThemeId,
+    pal: &'static Palette,
+    jobs: Sender<Job>,
     snap: Snapshot,
-    offset: usize,
-    show_session: bool,
-    anchor: Option<(u32, u16)>,
-    cur: Option<(u32, u16)>,
-    msg: String,
-    frame: Option<(String, render::ClickMap, usize, u64)>,
+    body: Option<(Body, usize, u64)>,
     gen: u64,
+    offset: usize,
+    list_off: usize,
+    show_session: bool,
+    hover: Option<Target>,
+    anchor: Option<(usize, usize)>,
+    cur: Option<(usize, usize)>,
+    pending_anchor: Option<(String, u32)>,
+    last_active: Option<usize>,
+    msg: String,
+    size: (usize, usize),
+    grab: bool,
+    grab_until: Instant,
+    refocus_at: Option<Instant>,
 }
 
 impl App {
-    fn rebuild(&mut self) {
-        match model::detect(&self.root).and_then(|s| model::build(&s)) {
-            Ok(mut snap) => {
-                let note = self.apply_session_filter(&mut snap);
-                self.msg = if note.is_empty() {
-                    format!("{} files +{} -{}", snap.files, snap.adds, snap.dels)
-                } else {
-                    format!(
-                        "{} files +{} -{} · {note}",
-                        snap.files, snap.adds, snap.dels
-                    )
-                };
+    fn apply(&mut self, res: Result<(Snapshot, String), String>) {
+        match res {
+            Ok((snap, note)) => {
+                if self.pending_anchor.is_none() {
+                    self.pending_anchor = self
+                        .body
+                        .as_ref()
+                        .and_then(|b| render::anchor(&b.0, self.offset));
+                }
+                self.msg = format!(
+                    "{} files +{} -{} · {note}",
+                    snap.files, snap.adds, snap.dels
+                );
                 self.snap = snap;
+                self.anchor = None;
+                self.cur = None;
                 self.gen += 1;
             }
             Err(e) => self.msg = e,
         }
     }
 
-    fn apply_session_filter(&mut self, snap: &mut Snapshot) -> String {
-        let Some(s) = &self.session else {
-            return "no session — showing all changes".to_string();
-        };
-        let touched = crate::session::edited_files_cached(s, &mut self.sess_cache);
-        if touched.is_empty() {
-            return "session has no mined edits yet — showing all".to_string();
+    fn draw(&mut self) -> Frame {
+        let (h, w) = self.size;
+        let stale = self
+            .body
+            .as_ref()
+            .is_none_or(|b| b.1 != w || b.2 != self.gen);
+        if stale {
+            let body = render::body(&self.snap, self.show_session, w, self.pal);
+            if let Some(o) = self
+                .pending_anchor
+                .take()
+                .and_then(|a| render::resolve_anchor(&body, &a))
+            {
+                self.offset = o;
+            }
+            self.body = Some((body, w, self.gen));
         }
-        model::retain_session(snap, &touched);
-        let short: String = s.id.chars().take(12).collect();
-        format!("session {} {short}: {} files", s.agent, snap.files)
+        let body = &self.body.as_ref().expect("body built above").0;
+        let ents = render::entries(&self.snap, self.show_session);
+        let body_h = render::geometry(ents.len(), body, h, 0).body_h;
+        self.offset = self.offset.min(render::max_offset(body, body_h));
+        let geo = render::geometry(ents.len(), body, h, self.offset);
+        if geo.active != self.last_active {
+            self.last_active = geo.active;
+            if let Some(pos) = geo.active.and_then(|f| render::entry_pos(&ents, f)) {
+                if pos < self.list_off {
+                    self.list_off = pos;
+                } else if pos >= self.list_off + geo.list_h {
+                    self.list_off = pos + 1 - geo.list_h;
+                }
+            }
+        }
+        self.list_off = self.list_off.min(ents.len().saturating_sub(geo.list_h));
+        let footer = format!(
+            "{} · click jump · drag send · t tests · r refresh · q quit",
+            self.msg
+        );
+        let frame = render::frame(&render::View {
+            snap: &self.snap,
+            body,
+            show_session: self.show_session,
+            width: w,
+            height: h,
+            offset: self.offset,
+            list_off: self.list_off,
+            hover: self.hover,
+            sel: self.anchor.zip(self.cur),
+            msg: &footer,
+            pal: self.pal,
+        });
+        paint(&frame.lines);
+        frame
     }
 
-    fn max_offset(&self, lines: usize, height: usize) -> usize {
-        lines.saturating_sub(height)
+    fn grabbed(&self) -> bool {
+        self.grab || Instant::now() < self.grab_until
     }
 
-    fn selection_payload(map: &render::ClickMap, a: (u32, u16), c: (u32, u16)) -> Option<String> {
-        let (r1, c1, r2, c2) = if (a.0, a.1) <= (c.0, c.1) {
-            (a.0, a.1, c.0, c.1)
-        } else {
-            (c.0, c.1, a.0, a.1)
+    fn refocus(&mut self) {
+        self.refocus_at = None;
+        self.grab = false;
+        self.grab_until = Instant::now() + GRAB_GRACE;
+        let _ = self.jobs.send(Job::Focus);
+    }
+
+    fn forward(&mut self, c: char) {
+        let _ = self.jobs.send(Job::Text(c.to_string()));
+        if self.refocus_at.is_some() {
+            self.refocus();
+        }
+    }
+
+    fn toggle_group(&mut self) {
+        self.pending_anchor = self
+            .body
+            .as_ref()
+            .and_then(|b| render::anchor(&b.0, self.offset));
+        self.show_session = !self.show_session;
+        self.gen += 1;
+    }
+
+    fn scroll(&mut self, d: i16) {
+        self.offset = self.offset.saturating_add_signed(d as isize);
+    }
+
+    fn handle(&mut self, ev: Ev, frame: Option<&Frame>, force: &Sender<()>) -> Flow {
+        let keyish = matches!(
+            ev,
+            Ev::Quit
+                | Ev::Refresh
+                | Ev::ToggleGroup
+                | Ev::Scroll(_)
+                | Ev::Top
+                | Ev::Bottom
+                | Ev::Esc
+        );
+        if keyish && self.grabbed() {
+            return Flow::Idle;
+        }
+        match ev {
+            Ev::Quit => Flow::Quit,
+            Ev::Refresh => {
+                let _ = force.send(());
+                Flow::Idle
+            }
+            Ev::ToggleGroup => {
+                self.toggle_group();
+                Flow::Redraw
+            }
+            Ev::Scroll(d) => {
+                self.scroll(d);
+                Flow::Redraw
+            }
+            Ev::Top => {
+                self.offset = 0;
+                Flow::Redraw
+            }
+            Ev::Bottom => {
+                self.offset = usize::MAX;
+                Flow::Redraw
+            }
+            Ev::Esc => {
+                self.anchor = None;
+                self.cur = None;
+                Flow::Redraw
+            }
+            Ev::Press(row, col) => self.press(frame, row as usize, col as usize),
+            Ev::Drag(row, col) => match frame {
+                Some(f) if self.anchor.is_some() => {
+                    self.cur = Some((f.body_row_clamped(row as usize), col as usize));
+                    Flow::Redraw
+                }
+                _ => Flow::Idle,
+            },
+            Ev::Release(row, col) => {
+                self.release(frame, row as usize, col as usize);
+                Flow::Redraw
+            }
+            Ev::Move(row, col) => {
+                let h = frame.and_then(|f| f.hit(row as usize, col as usize));
+                if h == self.hover {
+                    Flow::Idle
+                } else {
+                    self.hover = h;
+                    Flow::Redraw
+                }
+            }
+            Ev::Wheel(d, row) => {
+                self.grab = true;
+                self.refocus_at = Some(Instant::now() + WHEEL_IDLE);
+                if frame.is_some_and(|f| f.in_list(row as usize)) {
+                    self.list_off = self.list_off.saturating_add_signed(d as isize);
+                } else {
+                    self.scroll(d);
+                }
+                Flow::Redraw
+            }
+            Ev::Unknown => Flow::Idle,
+        }
+    }
+
+    fn press(&mut self, frame: Option<&Frame>, row: usize, col: usize) -> Flow {
+        self.grab = true;
+        let Some(f) = frame else {
+            return Flow::Idle;
         };
-        if r1 == r2 && c1 == c2 {
-            return None;
+        match f.hit(row, col) {
+            Some(Target::Close) => return Flow::Quit,
+            Some(Target::Group) => {
+                self.toggle_group();
+                return Flow::Redraw;
+            }
+            Some(Target::File(i)) => {
+                if let Some(start) = self.body.as_ref().map(|b| b.0.start_of(i)) {
+                    self.offset = start;
+                }
+                return Flow::Redraw;
+            }
+            None => {}
         }
-        let mut payload = String::new();
-        let mut last_file = String::new();
-        let mut picked = 0usize;
-        for cr in &map.content {
-            if cr.row < r1 || cr.row > r2 {
-                continue;
-            }
-            let (lo, hi) = if r1 == r2 {
-                (c1 as usize, c2 as usize)
-            } else if cr.row == r1 {
-                (c1 as usize, usize::MAX)
-            } else if cr.row == r2 {
-                (0, c2 as usize)
-            } else {
-                (0, usize::MAX)
-            };
-            let total = cr.text.chars().count();
-            let from = lo.saturating_sub(GUTTER_W).min(total);
-            let to = hi.saturating_sub(GUTTER_W).min(total);
-            if from >= to {
-                continue;
-            }
-            let frag: String = cr.text.chars().skip(from).take(to - from).collect();
-            if frag.trim().is_empty() {
-                continue;
-            }
-            if cr.file != last_file {
-                last_file = cr.file.clone();
-                payload.push_str(&format!("{}:{}\n", cr.file, cr.lineno));
-            }
-            payload.push_str(&frag);
-            payload.push('\n');
-            picked += 1;
+        if let Some(r) = f.body_row(row) {
+            self.anchor = Some((r, col));
+            self.cur = Some((r, col));
         }
-        if picked == 0 {
-            return None;
+        Flow::Redraw
+    }
+
+    fn release(&mut self, frame: Option<&Frame>, row: usize, col: usize) {
+        if let (Some(a), Some(f), Some(b)) = (self.anchor.take(), frame, self.body.as_ref()) {
+            let end = (f.body_row_clamped(row), col);
+            if let Some(p) = render::selection_payload(&b.0, a, end) {
+                self.msg = format!("sent {} lines to agent", p.lines().count());
+                let _ = self.jobs.send(Job::Text(p));
+            }
         }
-        payload.truncate(payload.trim_end().len());
-        Some(payload)
+        self.cur = None;
+        self.refocus();
     }
 }
 
-pub fn run_viewer(agent: &str, root: &str) -> i32 {
+fn paint(lines: &[Line]) {
+    let mut s = String::from("\x1b[?2026h");
+    for (i, l) in lines.iter().enumerate() {
+        s.push_str(&format!("\x1b[{};1H", i + 1));
+        l.encode(&mut s);
+    }
+    s.push_str("\x1b[?2026l");
+    let mut o = std::io::stdout();
+    let _ = o.write_all(s.as_bytes());
+    let _ = o.flush();
+}
+
+fn spawn_input(mut tty: std::fs::File, tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match tty.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for &b in &buf[..n] {
+                        if tx.send(Msg::Byte(b)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(Msg::InputClosed);
+    });
+}
+
+fn spawn_worker(agent: String, me: Option<String>, tx: Sender<Msg>) -> Sender<Job> {
+    let (jobs, rx) = mpsc::channel::<Job>();
+    std::thread::spawn(move || {
+        for job in rx {
+            match job {
+                Job::Focus => herdr_cli::focus_agent(&agent, me.as_deref()),
+                Job::Text(t) => {
+                    if let Err(e) = herdr_cli::send_text(&agent, &t) {
+                        let _ = tx.send(Msg::Note(format!("send failed: {e}")));
+                    }
+                }
+            }
+        }
+    });
+    jobs
+}
+
+fn spawn_refresher(
+    root: String,
+    agent: String,
+    theme: ThemeId,
+    tx: Sender<Msg>,
+    force: Receiver<()>,
+) {
+    std::thread::spawn(move || {
+        let theme = hl::theme(theme);
+        let mut last: Option<u64> = None;
+        let mut misses = 0;
+        let mut forced = true;
+        loop {
+            if !herdr_cli::pane_alive(&agent) {
+                misses += 1;
+                if misses >= 2 {
+                    let _ = tx.send(Msg::Gone);
+                    return;
+                }
+            } else {
+                misses = 0;
+            }
+            let sig = model::signature(&root);
+            if forced || last != Some(sig) {
+                last = Some(sig);
+                let res = model::detect(&root)
+                    .and_then(|s| model::build(&s, &theme))
+                    .map(|snap| (snap, "git changes".to_string()));
+                if tx.send(Msg::Snap(res)).is_err() {
+                    return;
+                }
+            }
+            forced = match force.recv_timeout(TICK) {
+                Ok(()) => true,
+                Err(RecvTimeoutError::Timeout) => false,
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+        }
+    });
+}
+
+pub fn run_viewer(agent: &str, root: &str, me: Option<String>) -> i32 {
     if let Err(e) = model::detect(root) {
         eprintln!("diff-viewer: {e}");
         return 1;
     }
+    let tty = match open_ctty() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("diff-viewer: {e}");
+            return 1;
+        }
+    };
+    let theme = hl::resolve_ctty(&tty);
+    let term = match Term::enter(tty) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("diff-viewer: {e}");
+            return 1;
+        }
+    };
+    let input = match term.tty.try_clone() {
+        Ok(t) => t,
+        Err(e) => {
+            drop(term);
+            eprintln!("diff-viewer: clone tty: {e}");
+            return 1;
+        }
+    };
+    let (tx, rx) = mpsc::channel();
+    spawn_input(input, tx.clone());
+    let (force_tx, force_rx) = mpsc::channel();
+    let jobs = spawn_worker(agent.to_string(), me, tx.clone());
+    spawn_refresher(root.to_string(), agent.to_string(), theme.id, tx, force_rx);
+
+    let mut r = Reader {
+        rx,
+        stash: VecDeque::new(),
+        pushback: Vec::new(),
+    };
     let mut app = App {
-        agent: agent.to_string(),
-        root: root.to_string(),
-        session: crate::session::resolve(agent),
-        sess_cache: crate::session::SessCache::new(),
-        theme: crate::hl::resolve().id,
+        pal: palette::for_dark(theme.id.is_dark()),
+        jobs,
         snap: Snapshot {
             main: Vec::new(),
             session: Vec::new(),
@@ -300,164 +649,121 @@ pub fn run_viewer(agent: &str, root: &str) -> i32 {
             adds: 0,
             dels: 0,
         },
+        body: None,
+        gen: 0,
         offset: 0,
+        list_off: 0,
         show_session: false,
+        hover: None,
         anchor: None,
         cur: None,
-        msg: String::new(),
-        frame: None,
-        gen: 0,
+        pending_anchor: None,
+        last_active: None,
+        msg: "loading…".to_string(),
+        size: size(&term.tty),
+        grab: false,
+        grab_until: Instant::now(),
+        refocus_at: None,
     };
-    app.rebuild();
-    let _term = match Term::enter() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("diff-viewer: {e}");
-            return 1;
-        }
-    };
-    let stdin = std::io::stdin();
-    let mut r = Reader {
-        stdin: stdin.lock(),
-        pushback: Vec::new(),
-    };
+    let mut frame: Option<Frame> = None;
+    let mut dirty = true;
+    let mut size_checked = Instant::now();
     loop {
-        let (rows, cols) = size();
-        let height = rows as usize - 1;
-        let width = cols as usize;
-        let stale = app
-            .frame
-            .as_ref()
-            .is_none_or(|f| f.2 != width || f.3 != app.gen);
-        if stale {
-            let (body, map) = render::render(&app.snap, app.show_session, width, app.theme);
-            app.frame = Some((body, map, width, app.gen));
+        if dirty {
+            frame = Some(app.draw());
+            dirty = false;
         }
-        let frame = app.frame.as_ref().expect("frame just rendered");
-        let lines: Vec<&str> = frame.0.lines().collect();
-        app.offset = app.offset.min(app.max_offset(lines.len(), height));
-        let max_row = lines.len().saturating_sub(1) as u32;
-        let abs = |r: u16| (r as u32 + app.offset as u32).min(max_row);
-        let mut o = std::io::stdout();
-        let _ = o.write_all(b"\x1b[H\x1b[J");
-        for line in lines.iter().skip(app.offset).take(height) {
-            let _ = o.write_all(line.as_bytes());
-            let _ = o.write_all(b"\r\n");
+        let wait = app
+            .refocus_at
+            .map_or(SIZE_POLL, |t| t.saturating_duration_since(Instant::now()))
+            .min(SIZE_POLL);
+        let msg = r.next(wait);
+        if size_checked.elapsed() >= SIZE_POLL {
+            size_checked = Instant::now();
+            let s = size(&term.tty);
+            if s != app.size {
+                app.size = s;
+                dirty = true;
+            }
         }
-        let footer = format!(
-            "\x1b[2m{}\x1b[0m",
-            truncate(
-                &format!(
-                    "{} · click jump, drag send, t tests, r refresh, q quit",
-                    app.msg
-                ),
-                width
-            )
-        );
-        let _ = o.write_all(footer.as_bytes());
-        let _ = o.flush();
-
-        match next_ev(&mut r) {
-            Ev::Quit => break,
-            Ev::Refresh => app.rebuild(),
-            Ev::ToggleGroup => {
-                app.show_session = !app.show_session;
-                app.gen += 1;
+        if app.refocus_at.is_some_and(|t| Instant::now() >= t) {
+            app.refocus();
+        }
+        match msg {
+            None => {}
+            Some(Msg::InputClosed) | Some(Msg::Gone) => return 0,
+            Some(Msg::Snap(res)) => {
+                app.apply(res);
+                dirty = true;
             }
-            Ev::Scroll(d) => {
-                app.offset = app.offset.saturating_add_signed(d as isize);
+            Some(Msg::Note(n)) => {
+                app.msg = n;
+                dirty = true;
             }
-            Ev::Top => app.offset = 0,
-            Ev::Bottom => app.offset = usize::MAX,
-            Ev::Esc => {
-                app.anchor = None;
-                app.cur = None;
-            }
-            Ev::Click(row, col) => {
-                let row = abs(row);
-                let hit_group = app.frame.as_ref().and_then(|f| f.1.group_row);
-                if hit_group == Some(row) {
-                    app.show_session = !app.show_session;
-                    app.gen += 1;
-                    continue;
-                }
-                let jump = app.frame.as_ref().and_then(|f| {
-                    f.1.file_rows
-                        .iter()
-                        .find(|(fr, _)| *fr == row)
-                        .and_then(|(_, path)| {
-                            f.1.section_rows
-                                .iter()
-                                .find(|(p, _)| p == path)
-                                .map(|(_, sec)| *sec as usize)
-                        })
-                });
-                if let Some(sec) = jump {
-                    app.offset = sec;
-                    continue;
-                }
-                app.anchor = Some((row, col));
-                app.cur = Some((row, col));
-            }
-            Ev::Drag(row, col) => {
-                if app.anchor.is_some() {
-                    app.cur = Some((abs(row), col));
-                }
-            }
-            Ev::Release(row, col) => {
-                if let Some(a) = app.anchor {
-                    app.anchor = None;
-                    app.cur = None;
-                    let payload = app
-                        .frame
-                        .as_ref()
-                        .and_then(|f| App::selection_payload(&f.1, a, (abs(row), col)));
-                    match payload {
-                        None => {}
-                        Some(p) => match herdr_cli::send_text(&app.agent, &p) {
-                            Ok(()) => {
-                                app.msg = format!("sent {} lines to agent", p.lines().count())
-                            }
-                            Err(e) => app.msg = format!("send failed: {e}"),
-                        },
+            Some(Msg::Byte(b)) => {
+                if b != 0x1b && app.grabbed() {
+                    if (0x20..0x7f).contains(&b) {
+                        app.forward(b as char);
                     }
+                    continue;
+                }
+                let ev = parse(b, &mut r);
+                match app.handle(ev, frame.as_ref(), &force_tx) {
+                    Flow::Quit => return 0,
+                    Flow::Redraw => dirty = true,
+                    Flow::Idle => {}
                 }
             }
-            Ev::Unknown => {}
         }
     }
-    0
-}
-
-fn truncate(s: &str, w: usize) -> String {
-    if s.chars().count() <= w {
-        return s.to_string();
-    }
-    s.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn reader(bytes: &[u8]) -> Reader {
+        let (_tx, rx) = mpsc::channel();
+        Reader {
+            rx,
+            stash: VecDeque::new(),
+            pushback: bytes.iter().rev().copied().collect(),
+        }
+    }
+
+    fn ev(bytes: &[u8]) -> Ev {
+        let mut r = reader(bytes);
+        let b = r.byte(SEQ_WAIT).unwrap();
+        parse(b, &mut r)
+    }
+
     #[test]
-    fn sgr_press_drag_release_wheel_decode() {
+    fn sgr_press_drag_move_release_wheel_decode() {
         assert!(matches!(decode_button(0), Mouse::Press));
         assert!(matches!(decode_button(32), Mouse::Drag));
+        assert!(matches!(decode_button(35), Mouse::Move));
         assert!(matches!(decode_button(3), Mouse::Release));
         assert!(matches!(decode_button(64), Mouse::WheelUp));
         assert!(matches!(decode_button(65), Mouse::WheelDown));
+        assert!(matches!(decode_button(2), Mouse::Other));
     }
 
     #[test]
     fn sgr_m_final_is_release_even_with_zero_button() {
-        let stdin = std::io::stdin();
-        let seq: Vec<u8> = b"\x1b[<0;30;14m".to_vec().into_iter().rev().collect();
-        let mut r = Reader {
-            stdin: stdin.lock(),
-            pushback: seq,
-        };
-        assert!(matches!(next_ev(&mut r), Ev::Release(13, 29)));
+        assert!(matches!(ev(b"\x1b[<0;30;14m"), Ev::Release(13, 29)));
+    }
+
+    #[test]
+    fn motion_and_wheel_carry_position() {
+        assert!(matches!(ev(b"\x1b[<35;5;3M"), Ev::Move(2, 4)));
+        assert!(matches!(ev(b"\x1b[<65;5;3M"), Ev::Wheel(3, 2)));
+    }
+
+    #[test]
+    fn lone_escape_and_keys() {
+        assert!(matches!(ev(b"\x1b"), Ev::Esc));
+        assert!(matches!(ev(b"q"), Ev::Quit));
+        assert!(matches!(ev(b"\x1b[6~"), Ev::Scroll(20)));
     }
 
     #[test]

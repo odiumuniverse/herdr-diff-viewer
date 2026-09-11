@@ -3,19 +3,19 @@ name = "Diff Viewer"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
-description = "Session diff sidebar: changed files with red/green hunks, click a file to jump, drag to send lines into the agent prompt."
+description = "Git diff sidebar: changed files with red/green hunks, click a file to jump, drag to send lines into the agent prompt."
 
 [[build]]
 command = ["cargo", "build", "--release"]
 
 [[actions]]
 id = "toggle"
-title = "Diff viewer: toggle session diff sidebar"
+title = "Diff viewer: toggle git diff sidebar"
 contexts = ["pane"]
 command = ["./target/release/diff-viewer", "toggle"]
 
 [[panes]]
 id = "viewer"
-title = "session diff"
+title = "git diff"
 placement = "split"
 command = ["./target/release/diff-viewer", "viewer"]
