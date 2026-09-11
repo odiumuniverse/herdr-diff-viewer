@@ -68,6 +68,19 @@ pub fn close_pane(pane: &str) -> Result<(), String> {
     run(&["pane", "close", pane]).map(|_| ())
 }
 
+pub fn sync_layout(pane: &str) {
+    let _ = run(&[
+        "pane",
+        "resize",
+        "--direction",
+        "left",
+        "--pane",
+        pane,
+        "--amount",
+        "0",
+    ]);
+}
+
 pub fn pane_alive(pane: &str) -> bool {
     run(&["pane", "get", pane]).is_ok()
 }

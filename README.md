@@ -12,6 +12,8 @@ Scope is a **union**, not a single repo: the pane's repo (or every child repo wh
 
 Opt out of background tracking with `DIFF_TRACK=0`.
 
+Toggle resyncs pane sizes after open/close (`resize --amount 0` is a no-op that still syncs pty winsizes), so neither the viewer nor the agent renders clipped until the next click.
+
 ## Theme
 
 Click `◑` in the header or press `T` for a theme menu — applies instantly, persists across toggles. `j`/`k` + `Enter` to pick, `Esc` to close.

@@ -41,6 +41,7 @@ fn toggle() -> i32 {
     if let Some(st) = state::load(&ctx.tab) {
         if herdr_cli::pane_alive(&st.viewer_pane) {
             let _ = herdr_cli::close_pane(&st.viewer_pane);
+            herdr_cli::sync_layout(&ctx.agent_pane);
             state::remove(&ctx.tab);
             return 0;
         }
@@ -57,6 +58,7 @@ fn toggle() -> i32 {
         eprintln!("diff-viewer: could not find new pane id in: {}", out.trim());
         return 1;
     };
+    herdr_cli::sync_layout(&id);
     let _ = state::save(
         &ctx.tab,
         &state::ToggleState {
@@ -178,6 +180,7 @@ fn viewer() -> i32 {
         if let Some(me) = me {
             state::remove(&tab);
             let _ = herdr_cli::close_pane(&me);
+            herdr_cli::sync_layout(&agent);
         }
     }
     code
