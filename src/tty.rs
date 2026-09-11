@@ -342,10 +342,7 @@ impl App {
             }
         }
         self.list_off = self.list_off.min(ents.len().saturating_sub(geo.list_h));
-        let footer = format!(
-            "{} · click jump · drag send · t tests · r refresh · q quit",
-            self.msg
-        );
+        let footer = self.msg.clone();
         let frame = render::frame(&render::View {
             snap: &self.snap,
             body,
