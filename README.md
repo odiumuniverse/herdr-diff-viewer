@@ -16,7 +16,7 @@ Git diff sidebar for [herdr](https://github.com): changed files with red/green h
 
 Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`).
 
-Scope is a **union**, not a single repo: the pane's repo (or every child repo when opened from a parent directory like `~/my`), plus every repo the agent has been seen in — the viewer follows `foreground_cwd` live, and background hooks (`pane.created` / `pane.focused` / `pane.agent_status_changed`) keep tracking even while the viewer is closed. The header shows `watching N` so you always know the blast radius. Untracked files included. One broken repo never blanks the view.
+Scope is a **union**, not a single repo: the pane's repo (or every child repo when opened from a parent directory like `~/my`), plus every repo the agent has been seen in — the viewer follows `foreground_cwd` live, and background hooks (`pane.created` / `pane.focused` / `pane.agent_status_changed`) keep tracking even while the viewer is closed. Agent panes often sit at `~` while the real work happens elsewhere, so the viewer also sweeps every agent pane of its tab and their child-process cwds (language servers, session processes) to discover those repos. The header shows `watching N` so you always know the blast radius. Untracked files included. One broken repo never blanks the view.
 
 Opt out of background tracking with `DIFF_TRACK=0`.
 

@@ -761,20 +761,11 @@ fn spawn_refresher(
         loop {
             ticks += 1;
             let mut scope_dirty = forced;
+            let mut candidates: Vec<String> = Vec::new();
             match herdr_cli::pane_cwd(&agent) {
                 Some(cwd) => {
                     misses = 0;
-                    if let Ok(top) = git::toplevel(&cwd) {
-                        let known = scope.as_ref().is_some_and(|s| s.repos.contains(&top));
-                        if !known && !touched.contains(&top) {
-                            touched.push(top);
-                            if touched.len() > state::MAX_TOUCHED {
-                                touched.remove(0);
-                            }
-                            state::save_touched(&tab, &touched);
-                            scope_dirty = true;
-                        }
-                    }
+                    candidates.push(cwd);
                 }
                 None => {
                     misses += 1;
@@ -782,6 +773,43 @@ fn spawn_refresher(
                         let _ = tx.send(Msg::Gone);
                         return;
                     }
+                }
+            }
+            // Agent panes often sit at `~` while the work happens in another
+            // repo (child processes run there), and the user may switch
+            // sessions within the tab — sweep every agent pane of our tab so
+            // such repos still enter the scope instead of staying invisible.
+            if misses == 0 {
+                match herdr_cli::tab_agent_panes(&tab) {
+                    Some(panes) if !panes.is_empty() => {
+                        for p in &panes {
+                            if let Some(c) = &p.cwd {
+                                candidates.push(c.clone());
+                            }
+                            candidates.extend(herdr_cli::pane_cwds(&p.pane_id));
+                        }
+                    }
+                    _ => candidates.extend(herdr_cli::pane_cwds(&agent)),
+                }
+                let mut added = false;
+                for cwd in candidates {
+                    if cwd.is_empty() {
+                        continue;
+                    }
+                    if let Ok(top) = git::toplevel(&cwd) {
+                        let known = scope.as_ref().is_some_and(|s| s.repos.contains(&top));
+                        if !known && !touched.contains(&top) {
+                            touched.push(top);
+                            added = true;
+                            scope_dirty = true;
+                        }
+                    }
+                }
+                if added {
+                    while touched.len() > state::MAX_TOUCHED {
+                        touched.remove(0);
+                    }
+                    state::save_touched(&tab, &touched);
                 }
             }
             if scope_dirty || scope.is_none() || ticks.is_multiple_of(RESCAN_EVERY) {

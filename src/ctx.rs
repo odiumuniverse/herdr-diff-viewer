@@ -24,10 +24,15 @@ pub fn read_action_ctx() -> Result<ActionCtx, String> {
 }
 
 pub fn find_str(json: &str, key: &str) -> Option<String> {
+    find_all_str(json, key).into_iter().next()
+}
+
+pub fn find_all_str(json: &str, key: &str) -> Vec<String> {
     let bytes = json.as_bytes();
     let pat = format!("\"{key}\"");
     let pb = pat.as_bytes();
     let n = bytes.len();
+    let mut out = Vec::new();
     let mut i = 0;
     while i < n {
         if bytes[i] != b'"' {
@@ -39,13 +44,15 @@ pub fn find_str(json: &str, key: &str) -> Option<String> {
             if bytes.get(j) == Some(&b':') {
                 j = skip_ws(bytes, j + 1);
                 if bytes.get(j) == Some(&b'"') && j < n {
-                    return Some(unquote(&json[j + 1..]));
+                    out.push(unquote(&json[j + 1..]));
+                    i = skip_string(bytes, j);
+                    continue;
                 }
             }
         }
         i = skip_string(bytes, i);
     }
-    None
+    out
 }
 
 fn skip_ws(bytes: &[u8], mut j: usize) -> usize {
@@ -145,6 +152,14 @@ mod tests {
     #[test]
     fn missing_key_is_none() {
         assert_eq!(find_str(r#"{"a":"1"}"#, "zzz"), None);
+    }
+
+    #[test]
+    fn all_values_collect_in_order() {
+        let json = r#"{"cwd":"/a","nested":{"cwd":"/b"},"cwd":"/c"}"#;
+        assert_eq!(find_all_str(json, "cwd"), vec!["/a", "/b", "/c"]);
+        assert_eq!(find_str(json, "cwd").as_deref(), Some("/a"));
+        assert!(find_all_str(json, "zzz").is_empty());
     }
 
     #[test]
