@@ -28,78 +28,32 @@ pub struct Snapshot {
 pub const MAX_REPOS: usize = 32;
 
 pub struct Scope {
-    pub root: String,
-    pub anchor: Option<String>,
     pub repos: Vec<String>,
 }
 
-pub fn detect(root: &str, touched: &[String]) -> Result<Scope, String> {
-    let root_c = git::canonical(root);
-    let mut anchor = None;
-    let mut repos: Vec<String> = Vec::new();
-    if let Ok(top) = git::toplevel(&root_c) {
-        anchor = Some(top.clone());
-        repos.push(top);
-    }
-    for t in touched {
-        if let Ok(top) = git::toplevel(t) {
-            if !repos.contains(&top) {
-                repos.push(top);
+pub fn assemble(repos: &[String]) -> Scope {
+    let mut out: Vec<String> = Vec::new();
+    for r in repos {
+        if let Ok(top) = git::toplevel(r) {
+            if !out.contains(&top) {
+                out.push(top);
             }
         }
     }
-    if anchor.is_none() && !is_huge(&root_c) {
-        let mut kids = git::child_repos(&root_c);
-        kids.sort_by_key(|k| {
-            std::fs::metadata(format!("{root_c}/{k}"))
-                .and_then(|m| m.modified())
-                .ok()
-        });
-        for k in kids.iter().rev() {
-            let c = git::canonical(&format!("{root_c}/{k}"));
-            if !repos.contains(&c) {
-                repos.push(c);
-            }
-        }
-    }
-    if repos.is_empty() {
-        return Err(format!(
-            "{root} is not a git repo and holds no repos — open the viewer from an agent pane"
-        ));
-    }
-    repos.truncate(MAX_REPOS);
-    if let Some(a) = anchor.clone() {
-        if !repos.contains(&a) {
-            repos.pop();
-            repos.insert(0, a);
-        }
-    }
-    Ok(Scope {
-        root: root_c,
-        anchor,
-        repos,
-    })
+    out.truncate(MAX_REPOS);
+    Scope { repos: out }
 }
 
-fn is_huge(root_c: &str) -> bool {
-    if root_c == "/" {
-        return true;
-    }
-    std::env::var("HOME")
-        .map(|h| git::canonical(&h) == root_c)
-        .unwrap_or(false)
-}
-
-fn short(root: &str, repo: &str) -> String {
-    let prefix = format!("{}/", root.trim_end_matches('/'));
-    if let Some(rest) = repo.strip_prefix(&prefix).filter(|r| !r.is_empty()) {
-        return rest.to_string();
-    }
-    repo.rsplit('/').next().unwrap_or(repo).to_string()
+fn base(repo: &str) -> String {
+    repo.rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(repo)
+        .to_string()
 }
 
 pub fn build(scope: &Scope, theme: &hl::Theme) -> Result<Snapshot, String> {
-    let multi = scope.anchor.is_none() || scope.repos.len() > 1;
+    let multi = scope.repos.len() > 1;
     let mut main = Vec::new();
     let mut session = Vec::new();
     for r in &scope.repos {
@@ -107,7 +61,7 @@ pub fn build(scope: &Scope, theme: &hl::Theme) -> Result<Snapshot, String> {
             continue;
         };
         if multi {
-            let prefix = short(&scope.root, r);
+            let prefix = base(r);
             for f in m.iter_mut().chain(s.iter_mut()) {
                 f.display = format!("{prefix}/{}", f.path);
             }
@@ -234,67 +188,64 @@ mod tests {
     }
 
     #[test]
-    fn detect_unions_children_and_touched() {
-        let base = std::env::temp_dir().join(format!("dv-union-{}", std::process::id()));
+    fn assemble_resolves_dedupes_and_drops_non_repos() {
+        let base = std::env::temp_dir().join(format!("dv-asm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let child = base.join("child");
-        let outside = std::env::temp_dir().join(format!("dv-out-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&outside);
+        let plain = base.join("plain");
         std::fs::create_dir_all(&child).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
         init_repo(&child);
-        init_repo(&outside);
-        let base_s = base.to_string_lossy().into_owned();
-        let outside_s = outside.to_string_lossy().into_owned();
-
-        let s = detect(&base_s, &[]).unwrap();
-        assert!(s.anchor.is_none());
-        assert_eq!(s.repos.len(), 1);
-
-        let s = detect(&base_s, std::slice::from_ref(&outside_s)).unwrap();
-        assert_eq!(s.repos.len(), 2);
-        assert!(s.repos.contains(&git::canonical(&outside_s)));
-
+        let child_s = child.to_string_lossy().into_owned();
+        let plain_s = plain.to_string_lossy().into_owned();
         let sub = child.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        let s = detect(&base_s, &[sub.to_string_lossy().into_owned()]).unwrap();
-        assert_eq!(s.repos.len(), 1, "subdir resolves to the child toplevel");
 
-        let s = detect(&child.to_string_lossy(), &[outside_s]).unwrap();
-        assert_eq!(
-            s.anchor.as_deref(),
-            Some(git::canonical(&child.to_string_lossy()).as_str())
-        );
-        assert_eq!(s.repos.len(), 2);
+        let s = assemble(&[
+            sub.to_string_lossy().into_owned(),
+            child_s.clone(),
+            plain_s,
+            "/no/such/dir".into(),
+        ]);
+        assert_eq!(s.repos, vec![git::canonical(&child_s)]);
 
+        assert!(assemble(&[]).repos.is_empty());
         let _ = std::fs::remove_dir_all(&base);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn short_labels_nested_relative_and_outside_basename() {
-        assert_eq!(short("/a/my", "/a/my/foo"), "foo");
-        assert_eq!(short("/a/my", "/a/my"), "my");
-        assert_eq!(short("/a/my", "/other/topscan"), "topscan");
-        assert_eq!(short("/", "/a/b"), "a/b");
+    fn base_labels_by_last_component() {
+        assert_eq!(base("/a/my/foo"), "foo");
+        assert_eq!(base("/other/topscan"), "topscan");
+        assert_eq!(base("/"), "/");
     }
 
     #[test]
-    fn build_union_prefixes_display_with_repo_names() {
+    fn build_prefixes_display_only_when_multi() {
         let base = std::env::temp_dir().join(format!("dv-build-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let child = base.join("child");
         std::fs::create_dir_all(&child).unwrap();
         init_repo(&child);
         std::fs::write(child.join("a.txt"), "one\ntwo\n").unwrap();
-        let base_s = base.to_string_lossy().into_owned();
+        let child_s = child.to_string_lossy().into_owned();
 
-        let scope = detect(&base_s, &[]).unwrap();
+        let scope = assemble(std::slice::from_ref(&child_s));
         let snap = build(&scope, &hl::theme(hl::ThemeId::ClaudeDark)).unwrap();
         assert_eq!(snap.files, 1);
-        assert_eq!(snap.main[0].display, "child/a.txt");
+        assert_eq!(snap.main[0].display, "a.txt");
         assert_eq!(snap.main[0].adds, 2);
         assert_eq!(snap.repos, 1);
+
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        init_repo(&other);
+        std::fs::write(other.join("b.txt"), "x\n").unwrap();
+        let scope = assemble(&[child_s, other.to_string_lossy().into_owned()]);
+        let snap = build(&scope, &hl::theme(hl::ThemeId::ClaudeDark)).unwrap();
+        assert_eq!(snap.files, 2);
+        assert!(snap.main.iter().any(|f| f.display == "child/a.txt"));
+        assert!(snap.main.iter().any(|f| f.display == "other/b.txt"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

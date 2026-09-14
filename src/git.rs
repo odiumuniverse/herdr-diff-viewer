@@ -136,25 +136,6 @@ pub fn untracked_adds(top: &str, path: &str) -> u32 {
     n
 }
 
-pub fn child_repos(root: &str) -> Vec<String> {
-    let mut repos = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return repos;
-    };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let p = e.path();
-        if p.is_dir() && p.join(".git").exists() {
-            repos.push(name);
-        }
-    }
-    repos.sort();
-    repos
-}
-
 #[derive(Clone, Copy, PartialEq)]
 pub enum DLKind {
     Ctx,
@@ -305,23 +286,6 @@ fn parse_hunk(h: &str) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn child_repos_finds_marked_dirs_only() {
-        let root = std::env::temp_dir().join(format!("dv-repos-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for d in ["apisrv", "plain", ".hidden"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        for d in ["apisrv", ".hidden"] {
-            std::fs::create_dir_all(root.join(d).join(".git")).unwrap();
-        }
-        assert_eq!(
-            child_repos(&root.to_string_lossy()),
-            vec!["apisrv".to_string()]
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
 
     #[test]
     fn parses_modified_added_and_renamed_porcelain() {

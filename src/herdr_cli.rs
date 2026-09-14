@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use crate::ctx::{find_all_str, find_str};
+use crate::ctx::find_str;
 
 pub const PLUGIN_ID: &str = "odiumuniverse.diff-viewer";
 
@@ -27,7 +27,6 @@ pub fn pane_id_after(out: &str, marker: &str) -> Option<String> {
 
 pub fn open_viewer(agent: &str, cwd: &str, tab: &str) -> Result<String, String> {
     let agent_env = format!("DIFF_AGENT={agent}");
-    let repo_env = format!("DIFF_REPO={cwd}");
     let tab_env = format!("DIFF_TAB={tab}");
     let theme_env = std::env::var("DIFF_THEME")
         .ok()
@@ -52,8 +51,6 @@ pub fn open_viewer(agent: &str, cwd: &str, tab: &str) -> Result<String, String> 
         "--no-focus",
         "--env",
         agent_env.as_str(),
-        "--env",
-        repo_env.as_str(),
         "--env",
         tab_env.as_str(),
     ];
@@ -85,44 +82,31 @@ pub fn pane_alive(pane: &str) -> bool {
     run(&["pane", "get", pane]).is_ok()
 }
 
-pub fn pane_cwd(pane: &str) -> Option<String> {
-    run(&["pane", "get", pane])
-        .ok()
-        .and_then(|out| pick_cwd(&out))
-}
-
-pub fn pick_cwd(json: &str) -> Option<String> {
-    find_str(json, "foreground_cwd")
-        .filter(|s| !s.is_empty())
-        .or_else(|| find_str(json, "cwd").filter(|s| !s.is_empty()))
-}
-
-pub struct TabPane {
+pub struct PaneInfo {
     pub pane_id: String,
-    pub cwd: Option<String>,
+    pub tab_id: String,
+    pub agent: String,
+    pub session: String,
 }
 
-/// Agent panes of one tab. Best-effort: empty vec when the shape is unknown.
-pub fn tab_agent_panes(tab: &str) -> Option<Vec<TabPane>> {
-    let out = run(&["pane", "list"]).ok()?;
-    Some(parse_pane_list(&out, tab))
-}
-
-fn parse_pane_list(out: &str, tab: &str) -> Vec<TabPane> {
-    let mut panes = Vec::new();
-    let Some(rel) = out
-        .find("\"panes\"")
-        .and_then(|i| out[i..].find('[').map(|r| i + r))
-    else {
-        return panes;
+fn split_array_objects(out: &str, key: &str) -> Vec<String> {
+    let mut objs = Vec::new();
+    let pat = format!("\"{key}\"");
+    let Some(k) = out.find(&pat) else {
+        return objs;
     };
-    let body = &out[rel..];
+    let rest = &out[k + pat.len()..];
+    let Some(rel) = rest.find('[') else {
+        return objs;
+    };
+    let body = &rest[rel..];
     let bytes = body.as_bytes();
+    let mut arr = 0usize;
     let mut depth = 0usize;
-    let mut start = None;
+    let mut start: Option<usize> = None;
     let mut in_str = false;
     let mut esc = false;
-    for (k, &b) in bytes.iter().enumerate() {
+    for (i, &b) in bytes.iter().enumerate() {
         if in_str {
             if esc {
                 esc = false;
@@ -135,12 +119,16 @@ fn parse_pane_list(out: &str, tab: &str) -> Vec<TabPane> {
         }
         match b {
             b'"' => in_str = true,
-            // `]` at brace-depth 0 closes the panes array — stop, the
-            // trailing envelope must not leak in as phantom panes.
-            b']' if depth == 0 && k > 0 => break,
+            b'[' => arr += 1,
+            b']' => {
+                arr = arr.saturating_sub(1);
+                if arr == 0 {
+                    break;
+                }
+            }
             b'{' => {
                 if depth == 0 {
-                    start = Some(k);
+                    start = Some(i);
                 }
                 depth += 1;
             }
@@ -148,43 +136,117 @@ fn parse_pane_list(out: &str, tab: &str) -> Vec<TabPane> {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     if let Some(s) = start.take() {
-                        let obj = &body[s..=k];
-                        if find_str(obj, "tab_id").as_deref() == Some(tab)
-                            && find_str(obj, "agent").is_some_and(|a| !a.is_empty())
-                        {
-                            if let Some(id) = find_str(obj, "pane_id") {
-                                panes.push(TabPane {
-                                    pane_id: id,
-                                    cwd: pick_cwd(obj),
-                                });
-                            }
-                        }
+                        objs.push(body[s..=i].to_string());
                     }
                 }
             }
             _ => {}
         }
     }
-    panes
+    objs
 }
 
-/// Every cwd reported for a pane's process tree. Agent panes often sit at `~`
-/// while their children (language servers, the agent session itself) run
-/// inside the real repo — those cwds are how such repos get discovered.
-pub fn pane_cwds(pane: &str) -> Vec<String> {
-    run(&["pane", "process-info", "--pane", pane])
-        .map(|out| extract_cwds(&out))
-        .unwrap_or_default()
+fn balanced_obj(s: &str) -> Option<String> {
+    let b = s.find('{')?;
+    let bytes = s.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = b;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == b'\\' {
+                esc = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(s[b..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
-fn extract_cwds(out: &str) -> Vec<String> {
-    let mut v: Vec<String> = find_all_str(out, "cwd")
+fn agent_session_value(obj: &str) -> String {
+    let Some(i) = obj.find("\"agent_session\"") else {
+        return String::new();
+    };
+    let rest =
+        obj[i + "\"agent_session\"".len()..].trim_start_matches([' ', '\t', '\n', '\r', ':']);
+    if rest.starts_with('n') {
+        return String::new();
+    }
+    let Some(sub) = balanced_obj(rest) else {
+        return String::new();
+    };
+    find_str(&sub, "value").unwrap_or_default()
+}
+
+pub fn parse_panes(out: &str) -> Vec<PaneInfo> {
+    split_array_objects(out, "panes")
         .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect();
+        .filter_map(|o| {
+            Some(PaneInfo {
+                pane_id: find_str(&o, "pane_id")?,
+                tab_id: find_str(&o, "tab_id").unwrap_or_default(),
+                agent: find_str(&o, "agent").unwrap_or_default(),
+                session: agent_session_value(&o),
+            })
+        })
+        .collect()
+}
+
+pub fn parse_pane(out: &str) -> Option<PaneInfo> {
+    let i = out.find("\"pane\"")?;
+    let obj = balanced_obj(&out[i..])?;
+    Some(PaneInfo {
+        pane_id: find_str(&obj, "pane_id")?,
+        tab_id: find_str(&obj, "tab_id").unwrap_or_default(),
+        agent: find_str(&obj, "agent").unwrap_or_default(),
+        session: agent_session_value(&obj),
+    })
+}
+
+pub fn pane_info(pane: &str) -> Option<PaneInfo> {
+    run(&["pane", "get", pane])
+        .ok()
+        .and_then(|out| parse_pane(&out))
+}
+
+pub fn parse_procs(out: &str) -> Vec<(String, String)> {
+    let mut v = Vec::new();
+    for o in split_array_objects(out, "foreground_processes") {
+        let (Some(pid), Some(cwd)) = (num_field(&o, "\"pid\""), find_str(&o, "cwd")) else {
+            continue;
+        };
+        if cwd.is_empty() {
+            continue;
+        }
+        v.push((pid.to_string(), cwd));
+    }
     v.sort();
     v.dedup();
     v
+}
+
+pub fn pane_processes(pane: &str) -> Vec<(String, String)> {
+    run(&["pane", "process-info", "--pane", pane])
+        .map(|out| parse_procs(&out))
+        .unwrap_or_default()
 }
 
 pub fn pane_rect(out: &str, pane: &str) -> Option<(usize, usize)> {
@@ -236,24 +298,6 @@ mod tests {
     }
 
     #[test]
-    fn foreground_cwd_wins_over_pane_cwd() {
-        let out =
-            r#"{"result":{"pane":{"cwd":"/Users/u/my","foreground_cwd":"/Users/u/topscan"}}}"#;
-        assert_eq!(pick_cwd(out).as_deref(), Some("/Users/u/topscan"));
-    }
-
-    #[test]
-    fn pane_cwd_is_fallback_when_foreground_missing() {
-        let out = r#"{"result":{"pane":{"cwd":"/Users/u/my"}}}"#;
-        assert_eq!(pick_cwd(out).as_deref(), Some("/Users/u/my"));
-    }
-
-    #[test]
-    fn empty_cwds_are_missing() {
-        assert_eq!(pick_cwd(r#"{"cwd":"","foreground_cwd":""}"#), None);
-        assert_eq!(pick_cwd(r#"{"n":1}"#), None);
-    }
-    #[test]
     fn pane_rect_reads_own_rect_after_pane_id() {
         let out = r#"{"result":{"layout":{"area":{"height":58,"width":188},"panes":[{"focused":true,"pane_id":"w4:p1","rect":{"height":58,"width":94,"x":0,"y":0}},{"focused":false,"pane_id":"w4:p2E","rect":{"height":58,"width":94,"x":94,"y":0}}]}}}"#;
         assert_eq!(pane_rect(out, "w4:p2E"), Some((58, 94)));
@@ -263,38 +307,53 @@ mod tests {
     }
 
     #[test]
-    fn pane_list_keeps_only_tab_agents() {
+    fn pane_list_parses_agent_session_and_cwd() {
         let out = r#"{"result":{"panes":[
-            {"agent":"opencode","cwd":"/Users/u","foreground_cwd":"/Users/u","pane_id":"w4:p1","tab_id":"w4:t1"},
+            {"agent":"opencode","agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_1"},"cwd":"/Users/u","foreground_cwd":"/Users/u/my/dv","pane_id":"w4:p1","tab_id":"w4:t1"},
+            {"agent":"claude","agent_session":null,"cwd":"/Users/u/topscan","pane_id":"w9:p2","tab_id":"w9:t2"},
             {"cwd":"/Users/u/my","pane_id":"w4:pK","tab_id":"w4:t1"},
-            {"agent":"","pane_id":"w4:pX","tab_id":"w4:t1"},
-            {"agent":"opencode","cwd":"/Users/u/my/dv","pane_id":"w4:p3D","tab_id":"w4:t9"}
+            {"agent":"","pane_id":"w4:pX","tab_id":"w4:t1"}
         ]},"type":"pane_list"}"#;
-        let t1 = parse_pane_list(out, "w4:t1");
-        assert_eq!(t1.len(), 1);
-        assert_eq!(t1[0].pane_id, "w4:p1");
-        assert_eq!(t1[0].cwd.as_deref(), Some("/Users/u"));
-        let t9 = parse_pane_list(out, "w4:t9");
-        assert_eq!(t9.len(), 1);
-        assert_eq!(t9[0].pane_id, "w4:p3D");
-        assert!(parse_pane_list(out, "w4:nope").is_empty());
-        assert!(parse_pane_list("garbage", "w4:t1").is_empty());
-        assert!(parse_pane_list(r#"{"result":{"panes":[]}}"#, "w4:t1").is_empty());
+        let panes = parse_panes(out);
+        assert_eq!(panes.len(), 4);
+        assert_eq!(panes[0].pane_id, "w4:p1");
+        assert_eq!(panes[0].tab_id, "w4:t1");
+        assert_eq!(panes[0].agent, "opencode");
+        assert_eq!(panes[0].session, "ses_1");
+        assert_eq!(panes[1].session, "");
+        assert_eq!(panes[2].agent, "");
+        assert!(parse_panes("garbage").is_empty());
     }
 
     #[test]
-    fn process_cwds_dedup_and_skip_empty() {
+    fn single_pane_get_parses_session() {
+        let out = r#"{"id":"cli:pane:get","result":{"pane":{"agent":"opencode","agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_9"},"cwd":"/Users/u/my/reword-tui","foreground_cwd":"/Users/u/my/reword-tui","pane_id":"w4:p1","tab_id":"w4:t1"}}}"#;
+        let p = parse_pane(out).expect("pane parses");
+        assert_eq!(p.pane_id, "w4:p1");
+        assert_eq!(p.tab_id, "w4:t1");
+        assert_eq!(p.agent, "opencode");
+        assert_eq!(p.session, "ses_9");
+        assert!(parse_pane("garbage").is_none());
+        assert!(parse_pane(r#"{"result":{"pane":{"pane_id":"w4:p9"}}}"#)
+            .is_some_and(|p| p.session.is_empty() && p.agent.is_empty()));
+    }
+
+    #[test]
+    fn process_pairs_carry_pid_and_skip_empty() {
         let out = r#"{"result":{"process_info":{
             "foreground_processes":[
-                {"argv":["opencode"],"cwd":"/Users/u","name":"opencode"},
-                {"argv":["rust-analyzer"],"cwd":"/Users/u/my/reword-tui/cli","name":"rust-analyzer"},
-                {"argv":["rust-analyzer"],"cwd":"/Users/u/my/reword-tui/cli","name":"rust-analyzer"},
-                {"argv":["sh"],"cwd":"","name":"sh"}
+                {"argv":["opencode"],"cwd":"/Users/u/my/reword-tui","name":"opencode.exe","pid":33795},
+                {"argv":["go","test"],"cwd":"/Users/u/my/agents-sync","name":"go","pid":44101},
+                {"argv":["go","test"],"cwd":"/Users/u/my/agents-sync","name":"go","pid":44101},
+                {"argv":["sh"],"cwd":"","name":"sh","pid":44102}
             ]}}}"#;
         assert_eq!(
-            extract_cwds(out),
-            vec!["/Users/u", "/Users/u/my/reword-tui/cli"]
+            parse_procs(out),
+            vec![
+                ("33795".to_string(), "/Users/u/my/reword-tui".to_string()),
+                ("44101".to_string(), "/Users/u/my/agents-sync".to_string()),
+            ]
         );
-        assert!(extract_cwds("garbage").is_empty());
+        assert!(parse_procs("garbage").is_empty());
     }
 }

@@ -16,7 +16,18 @@ Git diff sidebar for [herdr](https://github.com): changed files with red/green h
 
 Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`).
 
-Scope is a **union**, not a single repo: the pane's repo (or every child repo when opened from a parent directory like `~/my`), plus every repo the agent has been seen in — the viewer follows `foreground_cwd` live, and background hooks (`pane.created` / `pane.focused` / `pane.agent_status_changed`) keep tracking even while the viewer is closed. Agent panes often sit at `~` while the real work happens elsewhere, so the viewer also sweeps every agent pane of its tab and their child-process cwds (language servers, session processes) to discover those repos. The header shows `watching N` so you always know the blast radius. Untracked files included. One broken repo never blanks the view.
+Scope is **per agent session**, not per tab or pane cwd: a repo enters the
+scope only after the session is observed working in it (a new process of the
+session's tree runs with its cwd inside the repo). The pane's own cwd repo is
+never assumed — a session launched in one repo but working in another shows
+only the latter. Once a repo is in scope, all of its uncommitted changes are
+shown, whoever made them. When the session ends (agent exits, session id
+changes, pane/tab closes) its scope is deleted; a new session starts empty.
+The viewer follows live while open, and background hooks (`pane.created` /
+`pane.focused` / `pane.agent_status_changed`, plus `pane.closed` /
+`pane.exited` / `tab.closed` for cleanup) keep tracking even while the viewer
+is closed. The header shows `watching N` so you always know the blast radius.
+Untracked files included. One broken repo never blanks the view.
 
 Opt out of background tracking with `DIFF_TRACK=0`.
 
@@ -39,7 +50,7 @@ diff-viewer theme auto     # back to claude-code dark/light auto-detect
 
 | | `/diff` | diff-viewer |
 |---|---|---|
-| Multi-repo union scope | ❌ one repo | ✅ anchor + children + everywhere the agent went |
+| Multi-repo scope | ❌ one repo | ✅ session-observed repos only |
 | Live follow (1s) | ❌ snapshot | ✅ ticks while you work |
 | Click-to-jump file list | ❌ | ✅ |
 | Drag lines into prompt as `file:line` | ❌ | ✅ |

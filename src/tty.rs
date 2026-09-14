@@ -3,7 +3,6 @@ use std::io::{Read, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use crate::git;
 use crate::herdr_cli;
 use crate::hl::{self, ThemeId};
 use crate::model::{self, Snapshot};
@@ -741,7 +740,6 @@ fn spawn_worker(agent: String, me: Option<String>, _tx: Sender<Msg>) -> Sender<J
 const RESCAN_EVERY: u32 = 10;
 
 fn spawn_refresher(
-    root: String,
     agent: String,
     theme: ThemeId,
     tx: Sender<Msg>,
@@ -752,22 +750,48 @@ fn spawn_refresher(
     std::thread::spawn(move || {
         let mut theme_id = theme;
         let mut theme = hl::theme(theme);
-        let mut touched = state::load_touched(&tab);
-        let mut scope: Option<model::Scope> = None;
         let mut last: Option<u64> = None;
         let mut misses = 0;
         let mut forced = true;
         let mut ticks: u32 = 0;
+        let mut scope_repos: Vec<String> = Vec::new();
         loop {
             ticks += 1;
             let mut scope_dirty = forced;
-            let mut candidates: Vec<String> = Vec::new();
-            match herdr_cli::pane_cwd(&agent) {
-                Some(cwd) => {
-                    misses = 0;
-                    candidates.push(cwd);
+            match herdr_cli::run(&["pane", "list"]) {
+                Ok(out) => {
+                    let live: Vec<state::LivePane> = herdr_cli::parse_panes(&out)
+                        .into_iter()
+                        .map(|p| state::LivePane {
+                            pane: p.pane_id,
+                            tab: p.tab_id,
+                            agent: p.agent,
+                            session: p.session,
+                        })
+                        .collect();
+                    if live.iter().any(|l| l.pane == agent) {
+                        misses = 0;
+                    } else {
+                        misses += 1;
+                        if misses >= 2 {
+                            let _ = tx.send(Msg::Gone);
+                            return;
+                        }
+                    }
+                    if misses == 0 {
+                        state::prune(&live);
+                        for l in live.iter().filter(|l| l.tab == tab && !l.agent.is_empty()) {
+                            let procs = herdr_cli::pane_processes(&l.pane);
+                            state::observe(l, &procs);
+                        }
+                        let u = state::union_for_tab(&tab, Some(&live));
+                        if u != scope_repos {
+                            scope_repos = u;
+                            scope_dirty = true;
+                        }
+                    }
                 }
-                None => {
+                Err(_) => {
                     misses += 1;
                     if misses >= 2 {
                         let _ = tx.send(Msg::Gone);
@@ -775,50 +799,14 @@ fn spawn_refresher(
                     }
                 }
             }
-            // Agent panes often sit at `~` while the work happens in another
-            // repo (child processes run there), and the user may switch
-            // sessions within the tab — sweep every agent pane of our tab so
-            // such repos still enter the scope instead of staying invisible.
-            if misses == 0 {
-                match herdr_cli::tab_agent_panes(&tab) {
-                    Some(panes) if !panes.is_empty() => {
-                        for p in &panes {
-                            if let Some(c) = &p.cwd {
-                                candidates.push(c.clone());
-                            }
-                            candidates.extend(herdr_cli::pane_cwds(&p.pane_id));
-                        }
-                    }
-                    _ => candidates.extend(herdr_cli::pane_cwds(&agent)),
-                }
-                let mut added = false;
-                for cwd in candidates {
-                    if cwd.is_empty() {
-                        continue;
-                    }
-                    if let Ok(top) = git::toplevel(&cwd) {
-                        let known = scope.as_ref().is_some_and(|s| s.repos.contains(&top));
-                        if !known && !touched.contains(&top) {
-                            touched.push(top);
-                            added = true;
-                            scope_dirty = true;
-                        }
-                    }
-                }
-                if added {
-                    while touched.len() > state::MAX_TOUCHED {
-                        touched.remove(0);
-                    }
-                    state::save_touched(&tab, &touched);
-                }
-            }
-            if scope_dirty || scope.is_none() || ticks.is_multiple_of(RESCAN_EVERY) {
-                match model::detect(&root, &touched) {
-                    Ok(s) => scope = Some(s),
-                    Err(e) => {
-                        if scope.is_none() {
-                            let _ = tx.send(Msg::Snap(Err(e)));
-                        }
+            if scope_dirty || ticks.is_multiple_of(RESCAN_EVERY) {
+                let scope = model::assemble(&scope_repos);
+                let sig = model::signature(&scope.repos);
+                if forced || last != Some(sig) {
+                    last = Some(sig);
+                    let res = model::build(&scope, &theme);
+                    if tx.send(Msg::Snap(res)).is_err() {
+                        return;
                     }
                 }
             }
@@ -835,16 +823,6 @@ fn spawn_refresher(
                         if let Some((rows, cols)) = herdr_cli::pane_rect(&out, me) {
                             let _ = tx.send(Msg::Size(rows, cols));
                         }
-                    }
-                }
-            }
-            if let Some(s) = &scope {
-                let sig = model::signature(&s.repos);
-                if forced || last != Some(sig) {
-                    last = Some(sig);
-                    let res = model::build(s, &theme);
-                    if tx.send(Msg::Snap(res)).is_err() {
-                        return;
                     }
                 }
             }
@@ -865,15 +843,22 @@ fn spawn_refresher(
     });
 }
 
-pub fn run_viewer(agent: &str, root: &str, me: Option<String>, tab: &str) -> i32 {
-    let touched = state::load_touched(tab);
-    let scope = match model::detect(root, &touched) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("diff-viewer: {e}");
-            return 1;
-        }
-    };
+pub fn run_viewer(agent: &str, me: Option<String>, tab: &str) -> i32 {
+    let live: Option<Vec<state::LivePane>> = herdr_cli::run(&["pane", "list"]).ok().map(|out| {
+        herdr_cli::parse_panes(&out)
+            .into_iter()
+            .map(|p| state::LivePane {
+                pane: p.pane_id,
+                tab: p.tab_id,
+                agent: p.agent,
+                session: p.session,
+            })
+            .collect()
+    });
+    if let Some(live) = &live {
+        state::prune(live);
+    }
+    let scope = model::assemble(&state::union_for_tab(tab, live.as_deref()));
     let tty = match open_ctty() {
         Ok(t) => t,
         Err(e) => {
@@ -916,7 +901,6 @@ pub fn run_viewer(agent: &str, root: &str, me: Option<String>, tab: &str) -> i32
     let (force_tx, force_rx) = mpsc::channel();
     let jobs = spawn_worker(agent.to_string(), me.clone(), tx.clone());
     spawn_refresher(
-        root.to_string(),
         agent.to_string(),
         theme.id,
         tx,

@@ -1,6 +1,6 @@
 id = "odiumuniverse.diff-viewer"
 name = "Diff Viewer"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
 description = "✨ Beautiful & ⚡ BLAZINGLY FAST git diff sidebar: changed files with red/green hunks, click a file to jump, drag to send lines into the agent prompt. 🦀"
@@ -24,6 +24,18 @@ command = ["./target/release/diff-viewer", "track-event"]
 
 [[events]]
 on = "pane.agent_status_changed"
+command = ["./target/release/diff-viewer", "track-event"]
+
+[[events]]
+on = "pane.closed"
+command = ["./target/release/diff-viewer", "track-event"]
+
+[[events]]
+on = "pane.exited"
+command = ["./target/release/diff-viewer", "track-event"]
+
+[[events]]
+on = "tab.closed"
 command = ["./target/release/diff-viewer", "track-event"]
 
 [[panes]]
