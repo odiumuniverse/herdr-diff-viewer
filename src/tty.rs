@@ -744,7 +744,6 @@ fn spawn_refresher(
     theme: ThemeId,
     tx: Sender<Msg>,
     force: Receiver<Force>,
-    tab: String,
     me: Option<String>,
 ) {
     std::thread::spawn(move || {
@@ -780,11 +779,11 @@ fn spawn_refresher(
                     }
                     if misses == 0 {
                         state::prune(&live);
-                        for l in live.iter().filter(|l| l.tab == tab && !l.agent.is_empty()) {
+                        if let Some(l) = live.iter().find(|l| l.pane == agent) {
                             let procs = herdr_cli::pane_processes(&l.pane);
                             state::observe(l, &procs);
                         }
-                        let u = state::union_for_tab(&tab, Some(&live));
+                        let u = state::session_repos(&agent, &live);
                         if u != scope_repos {
                             scope_repos = u;
                             scope_dirty = true;
@@ -843,7 +842,7 @@ fn spawn_refresher(
     });
 }
 
-pub fn run_viewer(agent: &str, me: Option<String>, tab: &str) -> i32 {
+pub fn run_viewer(agent: &str, me: Option<String>) -> i32 {
     let live: Option<Vec<state::LivePane>> = herdr_cli::run(&["pane", "list"]).ok().map(|out| {
         herdr_cli::parse_panes(&out)
             .into_iter()
@@ -858,7 +857,10 @@ pub fn run_viewer(agent: &str, me: Option<String>, tab: &str) -> i32 {
     if let Some(live) = &live {
         state::prune(live);
     }
-    let scope = model::assemble(&state::union_for_tab(tab, live.as_deref()));
+    let scope = model::assemble(&match &live {
+        Some(live) => state::session_repos(agent, live),
+        None => Vec::new(),
+    });
     let tty = match open_ctty() {
         Ok(t) => t,
         Err(e) => {
@@ -900,14 +902,7 @@ pub fn run_viewer(agent: &str, me: Option<String>, tab: &str) -> i32 {
     spawn_input(input, tx.clone());
     let (force_tx, force_rx) = mpsc::channel();
     let jobs = spawn_worker(agent.to_string(), me.clone(), tx.clone());
-    spawn_refresher(
-        agent.to_string(),
-        theme.id,
-        tx,
-        force_rx,
-        tab.to_string(),
-        me,
-    );
+    spawn_refresher(agent.to_string(), theme.id, tx, force_rx, me);
 
     let mut r = Reader {
         rx,

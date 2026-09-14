@@ -16,22 +16,21 @@ Git diff sidebar for [herdr](https://github.com): changed files with red/green h
 
 Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`).
 
-Scope is **per agent session**, not per tab or pane cwd: a repo enters the
-scope after the session is observed working in it — a new process of the
-session's tree runs with its cwd inside the repo, or the repo's working
-tree changes while the session is alive. Neighbour repos (siblings of the
-session's directories) and `DIFF_WATCH_ROOTS` roots (colon-separated) are
-watched for changes too, so edits anywhere the agent writes are picked up
-no matter the pane cwd. The pane's own cwd repo is never assumed — a
-session that changed nothing there shows nothing from it, even if dirty.
-Once a repo is in scope, all of its uncommitted changes are shown, whoever
-made them. When the session ends (agent exits, session id changes,
-pane/tab closes) its scope is deleted; a new session starts empty.
-The viewer follows live while open, and background hooks (`pane.created` /
-`pane.focused` / `pane.agent_status_changed`, plus `pane.closed` /
-`pane.exited` / `tab.closed` for cleanup) keep tracking even while the viewer
-is closed. The header shows `watching N` so you always know the blast radius.
-Untracked files included. One broken repo never blanks the view.
+Scope is **per agent session**, never per tab or pane cwd: a repo enters the
+scope only after a new process of the session's own tree runs with its cwd
+inside that repo. The first sight of a pane only baselines running processes.
+The pane's own cwd repo is never assumed — a session that changed nothing
+there shows nothing from it, even if dirty. Once a repo is in scope, all of
+its uncommitted changes are shown, whoever made them. When the session ends
+(agent exits, session id or agent changes, pane/tab closes) its scope is
+deleted; a new session starts empty. Sessions that never spawn processes
+(pure file edits with zero shell activity) stay invisible to herdr and show
+an empty scope. The viewer follows its own agent pane live — neighbour panes
+never leak in — and background hooks (`pane.created` / `pane.focused` /
+`pane.agent_status_changed`, plus `pane.closed` / `pane.exited` / `tab.closed`
+for cleanup) keep tracking even while the viewer is closed. The header shows
+`watching N` so you always know the blast radius. Untracked files included.
+One broken repo never blanks the view.
 
 Opt out of background tracking with `DIFF_TRACK=0`.
 
@@ -54,7 +53,7 @@ diff-viewer theme auto     # back to claude-code dark/light auto-detect
 
 | | `/diff` | diff-viewer |
 |---|---|---|
-| Multi-repo scope | ❌ one repo | ✅ session-observed repos only |
+| Multi-repo scope | ❌ one repo | ✅ own session's repos only |
 | Live follow (1s) | ❌ snapshot | ✅ ticks while you work |
 | Click-to-jump file list | ❌ | ✅ |
 | Drag lines into prompt as `file:line` | ❌ | ✅ |

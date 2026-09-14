@@ -45,18 +45,14 @@ pub fn remove(tab: &str) {
 
 pub const MAX_SESSION_REPOS: usize = 64;
 pub const MAX_SEEN: usize = 256;
-pub const MAX_SIG_CANDIDATES: usize = 16;
-pub const MAX_CANDIDATE_CWDS: usize = 16;
-pub const SIG_THROTTLE_SECS: u64 = 5;
 
 pub struct PaneEntry {
     pub pane: String,
     pub tab: String,
+    pub agent: String,
     pub session: String,
     pub repos: Vec<String>,
     pub seen: Vec<String>,
-    pub sig: Vec<String>,
-    pub sigcheck: u64,
     pub updated: u64,
 }
 
@@ -94,16 +90,14 @@ fn now_secs() -> u64 {
 fn entry_body(e: &PaneEntry) -> String {
     let repos: Vec<String> = e.repos.iter().map(|r| format!("\"{}\"", esc(r))).collect();
     let seen: Vec<String> = e.seen.iter().map(|s| format!("\"{}\"", esc(s))).collect();
-    let sig: Vec<String> = e.sig.iter().map(|s| format!("\"{}\"", esc(s))).collect();
     format!(
-        "{{\"pane\":\"{}\",\"tab\":\"{}\",\"session\":\"{}\",\"repos\":[{}],\"seen\":[{}],\"sig\":[{}],\"sigcheck\":\"{}\",\"updated\":\"{}\"}}",
+        "{{\"pane\":\"{}\",\"tab\":\"{}\",\"agent\":\"{}\",\"session\":\"{}\",\"repos\":[{}],\"seen\":[{}],\"updated\":\"{}\"}}",
         esc(&e.pane),
         esc(&e.tab),
+        esc(&e.agent),
         esc(&e.session),
         repos.join(","),
         seen.join(","),
-        sig.join(","),
-        e.sigcheck,
         e.updated
     )
 }
@@ -112,13 +106,10 @@ fn entry_from_body(body: &str) -> Option<PaneEntry> {
     Some(PaneEntry {
         pane: find_str(body, "pane")?,
         tab: find_str(body, "tab").unwrap_or_default(),
+        agent: find_str(body, "agent").unwrap_or_default(),
         session: find_str(body, "session").unwrap_or_default(),
         repos: str_array(body, "repos"),
         seen: str_array(body, "seen"),
-        sig: str_array(body, "sig"),
-        sigcheck: find_str(body, "sigcheck")
-            .and_then(|u| u.parse().ok())
-            .unwrap_or(0),
         updated: find_str(body, "updated")
             .and_then(|u| u.parse().ok())
             .unwrap_or(0),
@@ -146,7 +137,11 @@ pub fn load_entry(pane: &str) -> Option<PaneEntry> {
 }
 
 pub fn save_entry(e: &PaneEntry) {
-    let _ = fs::write(session_path(&e.pane), entry_body(e));
+    let path = session_path(&e.pane);
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, entry_body(e)).is_ok() {
+        let _ = fs::rename(&tmp, &path);
+    }
 }
 
 pub fn remove_entry(pane: &str) {
@@ -193,33 +188,22 @@ fn legacy_cleanup() {
 }
 
 pub fn observe(live: &LivePane, procs: &[(String, String)]) -> PaneEntry {
-    let Some(mut e) = load_entry(&live.pane) else {
+    let Some(e) = load_entry(&live.pane) else {
         let mut e = PaneEntry {
             pane: live.pane.clone(),
             tab: live.tab.clone(),
+            agent: live.agent.clone(),
             session: live.session.clone(),
             repos: Vec::new(),
             seen: Vec::new(),
-            sig: Vec::new(),
-            sigcheck: 0,
             updated: now_secs(),
         };
         baseline(&mut e, procs);
         save_entry(&e);
         return e;
     };
-    let mut changed = false;
-    if e.session != live.session {
-        e.session = live.session.clone();
-        e.repos.clear();
-        changed = true;
-    }
-    if e.tab != live.tab {
-        e.tab = live.tab.clone();
-        changed = true;
-    }
+    let (mut e, mut changed) = reconcile(e, live);
     changed |= admit(&mut e, procs);
-    changed |= check_signatures(&mut e);
     if changed {
         e.updated = now_secs();
         save_entry(&e);
@@ -227,119 +211,27 @@ pub fn observe(live: &LivePane, procs: &[(String, String)]) -> PaneEntry {
     e
 }
 
-fn parent_dir(cwd: &str) -> String {
-    std::path::Path::new(cwd)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default()
-}
-
-fn watch_roots() -> Vec<String> {
-    std::env::var("DIFF_WATCH_ROOTS")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
-}
-
-fn push_candidate(out: &mut Vec<String>, r: String) {
-    if out.len() < MAX_SIG_CANDIDATES && !r.is_empty() && !out.contains(&r) {
-        out.push(r);
-    }
-}
-
-fn candidate_repos(e: &PaneEntry) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cwds: Vec<String> = Vec::new();
-    for key in &e.seen {
-        let Some((_, cwd)) = key.split_once('\u{1f}') else {
-            continue;
-        };
-        if !cwds.iter().any(|c| c == cwd) {
-            cwds.push(cwd.to_string());
-        }
-        if cwds.len() >= MAX_CANDIDATE_CWDS {
-            break;
-        }
-    }
-    for cwd in &cwds {
-        if out.len() >= MAX_SIG_CANDIDATES {
-            break;
-        }
-        let Ok(top) = crate::git::toplevel(cwd) else {
-            continue;
-        };
-        push_candidate(&mut out, top.clone());
-        let p = parent_dir(&top);
-        if p.is_empty() || crate::git::is_huge(&p) {
-            continue;
-        }
-        for c in crate::git::child_repos(&p) {
-            if out.len() >= MAX_SIG_CANDIDATES {
-                break;
-            }
-            push_candidate(&mut out, c);
-        }
-    }
-    for r in watch_roots() {
-        if out.len() >= MAX_SIG_CANDIDATES {
-            break;
-        }
-        if crate::git::is_huge(&r) {
-            continue;
-        }
-        if let Ok(top) = crate::git::toplevel(&r) {
-            push_candidate(&mut out, top);
-        }
-        for c in crate::git::child_repos(&r) {
-            if out.len() >= MAX_SIG_CANDIDATES {
-                break;
-            }
-            push_candidate(&mut out, c);
-        }
-    }
-    out
-}
-
-fn check_signatures(e: &mut PaneEntry) -> bool {
-    let now = now_secs();
-    if now.saturating_sub(e.sigcheck) < SIG_THROTTLE_SECS {
-        return false;
-    }
-    e.sigcheck = now;
+fn reconcile(mut e: PaneEntry, live: &LivePane) -> (PaneEntry, bool) {
     let mut changed = false;
-    let tops = candidate_repos(e);
-    for top in &tops {
-        let hash = format!("{:x}", crate::model::signature(std::slice::from_ref(top)));
-        let mark = format!("{top}\u{1f}{hash}");
-        match e
-            .sig
-            .iter()
-            .position(|s| s.split_once('\u{1f}').is_some_and(|(t, _)| t == top))
-        {
-            None => {
-                e.sig.push(mark);
-                changed = true;
-            }
-            Some(i) => {
-                if e.sig[i] != mark {
-                    e.sig[i] = mark;
-                    changed = true;
-                    if !e.repos.contains(top) {
-                        e.repos.push(top.clone());
-                    }
-                }
-            }
-        }
+    if e.session != live.session {
+        e.session = live.session.clone();
+        e.repos.clear();
+        changed = true;
     }
-    while e.repos.len() > MAX_SESSION_REPOS {
-        e.repos.remove(0);
+    if e.agent.is_empty() {
+        e.agent = live.agent.clone();
+        changed = true;
+    } else if e.agent != live.agent {
+        e.session = live.session.clone();
+        e.agent = live.agent.clone();
+        e.repos.clear();
+        changed = true;
     }
-    while e.sig.len() > MAX_SIG_CANDIDATES * 4 {
-        e.sig.remove(0);
+    if e.tab != live.tab {
+        e.tab = live.tab.clone();
+        changed = true;
     }
-    changed
+    (e, changed)
 }
 
 fn baseline(e: &mut PaneEntry, procs: &[(String, String)]) {
@@ -392,51 +284,25 @@ pub fn prune(live: &[LivePane]) {
             Some(l) => {
                 if l.agent.is_empty() {
                     remove_entry(&e.pane);
-                } else if l.session != e.session {
-                    save_entry(&PaneEntry {
-                        pane: e.pane.clone(),
-                        tab: l.tab.clone(),
-                        session: l.session.clone(),
-                        repos: Vec::new(),
-                        seen: e.seen,
-                        sig: Vec::new(),
-                        sigcheck: 0,
-                        updated: now_secs(),
-                    });
+                } else {
+                    let (fresh, changed) = reconcile(e, l);
+                    if changed {
+                        save_entry(&fresh);
+                    }
                 }
             }
         }
     }
 }
 
-pub fn union_for_tab(tab: &str, live: Option<&[LivePane]>) -> Vec<String> {
-    let mut out = Vec::new();
-    let push = |out: &mut Vec<String>, repos: &[String]| {
-        for r in repos {
-            if !out.contains(r) {
-                out.push(r.clone());
-            }
-        }
+pub fn session_repos(agent: &str, live: &[LivePane]) -> Vec<String> {
+    let Some(l) = live.iter().find(|p| p.pane == agent && !p.agent.is_empty()) else {
+        return Vec::new();
     };
-    match live {
-        Some(live) => {
-            for l in live.iter().filter(|l| l.tab == tab && !l.agent.is_empty()) {
-                if let Some(e) = load_entry(&l.pane) {
-                    if e.session == l.session {
-                        push(&mut out, &e.repos);
-                    }
-                }
-            }
-        }
-        None => {
-            for e in list_entries() {
-                if e.tab == tab {
-                    push(&mut out, &e.repos);
-                }
-            }
-        }
+    match load_entry(&l.pane) {
+        Some(e) if e.session == l.session && (e.agent.is_empty() || e.agent == l.agent) => e.repos,
+        _ => Vec::new(),
     }
-    out
 }
 
 pub fn theme_file() -> PathBuf {
@@ -668,98 +534,6 @@ mod tests {
         });
     }
 
-    fn force_sigcheck(pane: &str) {
-        if let Some(mut e) = load_entry(pane) {
-            e.sigcheck = 0;
-            save_entry(&e);
-        }
-    }
-
-    #[test]
-    fn signature_change_admits_baselined_repo() {
-        with_state_dir(|| {
-            let parent = std::env::temp_dir().join(format!("dv-psig-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&parent);
-            let base = parent.join("repo");
-            let sub = base.join("sub");
-            fs::create_dir_all(&sub).unwrap();
-            let top = init_repo(&base);
-            let l = live("w1:p7", "w1:t1", "opencode", "ses_sig");
-            let sub_s = sub.to_string_lossy().into_owned();
-            let e = observe(&l, &[("1".into(), sub_s.clone())]);
-            assert!(e.repos.is_empty());
-            force_sigcheck("w1:p7");
-            let e = observe(&l, &[("1".into(), sub_s.clone())]);
-            assert!(e.repos.is_empty());
-            std::fs::write(base.join("f.txt"), "one\ntwo\n").unwrap();
-            force_sigcheck("w1:p7");
-            let e = observe(&l, &[("1".into(), sub_s)]);
-            assert_eq!(e.repos, vec![top]);
-            let _ = fs::remove_dir_all(&parent);
-        });
-    }
-
-    #[test]
-    fn signature_change_admits_sibling_repo() {
-        with_state_dir(|| {
-            let parent = std::env::temp_dir().join(format!("dv-sib-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&parent);
-            let a = parent.join("repoA");
-            let b = parent.join("repoB");
-            let sub = a.join("sub");
-            fs::create_dir_all(&sub).unwrap();
-            fs::create_dir_all(&b).unwrap();
-            let ta = init_repo(&a);
-            let tb = init_repo(&b);
-            let l = live("w1:p8", "w1:t1", "opencode", "ses_sib");
-            let sub_s = sub.to_string_lossy().into_owned();
-            let e = observe(&l, &[("1".into(), sub_s.clone())]);
-            assert!(e.repos.is_empty());
-            force_sigcheck("w1:p8");
-            let e = observe(&l, &[("1".into(), sub_s.clone())]);
-            assert!(e.repos.is_empty());
-            std::fs::write(b.join("f.txt"), "one\ntwo\n").unwrap();
-            force_sigcheck("w1:p8");
-            let e = observe(&l, &[("1".into(), sub_s.clone())]);
-            assert_eq!(e.repos, vec![tb.clone()]);
-            std::fs::write(a.join("g.txt"), "three\n").unwrap();
-            force_sigcheck("w1:p8");
-            let e = observe(&l, &[("1".into(), sub_s)]);
-            assert_eq!(e.repos.len(), 2);
-            assert!(e.repos.contains(&ta));
-            assert!(e.repos.contains(&tb));
-            let _ = fs::remove_dir_all(&parent);
-        });
-    }
-
-    #[test]
-    fn watch_roots_extend_candidates() {
-        with_state_dir(|| {
-            let home = std::env::temp_dir().join(format!("dv-wr-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&home);
-            let work = home.join("work");
-            let far = home.join("far");
-            let repo = far.join("repoC");
-            fs::create_dir_all(&work).unwrap();
-            fs::create_dir_all(&repo).unwrap();
-            let tc = init_repo(&repo);
-            std::env::set_var("DIFF_WATCH_ROOTS", far.to_string_lossy().into_owned());
-            let l = live("w1:p9", "w1:t1", "opencode", "ses_wr");
-            let work_s = work.to_string_lossy().into_owned();
-            let e = observe(&l, &[("1".into(), work_s.clone())]);
-            assert!(e.repos.is_empty());
-            force_sigcheck("w1:p9");
-            let e = observe(&l, &[("1".into(), work_s.clone())]);
-            assert!(e.repos.is_empty());
-            std::fs::write(repo.join("f.txt"), "one\ntwo\n").unwrap();
-            force_sigcheck("w1:p9");
-            let e = observe(&l, &[("1".into(), work_s)]);
-            assert_eq!(e.repos, vec![tc]);
-            std::env::remove_var("DIFF_WATCH_ROOTS");
-            let _ = fs::remove_dir_all(&home);
-        });
-    }
-
     #[test]
     fn session_switch_resets_repos_but_keeps_baseline() {
         with_state_dir(|| {
@@ -797,36 +571,76 @@ mod tests {
     }
 
     #[test]
-    fn union_covers_only_matching_live_sessions() {
+    fn agent_swap_resets_repos() {
         with_state_dir(|| {
             save_entry(&PaneEntry {
                 pane: "w1:p1".into(),
                 tab: "w1:t1".into(),
+                agent: "opencode".into(),
+                session: "s1".into(),
+                repos: vec!["/r/one".into()],
+                seen: vec!["1\x1f/x".into()],
+                updated: 1,
+            });
+            let e = observe(&live("w1:p1", "w1:t1", "claude", "s9"), &[]);
+            assert_eq!(e.agent, "claude");
+            assert_eq!(e.session, "s9");
+            assert!(e.repos.is_empty());
+            assert_eq!(e.seen, vec!["1\x1f/x".to_string()]);
+        });
+    }
+
+    #[test]
+    fn empty_agent_is_adopted_without_reset() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("dv-adopt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
+        std::fs::write(
+            dir.join("session-w1_p1.json"),
+            r#"{"pane":"w1:p1","tab":"w1:t1","session":"s1","repos":["/r/one"],"seen":[],"updated":"1"}"#,
+        )
+        .unwrap();
+        let e = observe(&live("w1:p1", "w1:t1", "opencode", "s1"), &[]);
+        assert_eq!(e.agent, "opencode");
+        assert_eq!(e.repos, vec!["/r/one".to_string()]);
+        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_repos_serves_only_own_live_session() {
+        with_state_dir(|| {
+            save_entry(&PaneEntry {
+                pane: "w1:p1".into(),
+                tab: "w1:t1".into(),
+                agent: "opencode".into(),
                 session: "s1".into(),
                 repos: vec!["/r/one".into()],
                 seen: Vec::new(),
-                sig: Vec::new(),
-                sigcheck: now_secs(),
                 updated: 1,
             });
             save_entry(&PaneEntry {
                 pane: "w1:p2".into(),
                 tab: "w1:t1".into(),
-                session: "s-old".into(),
+                agent: "opencode".into(),
+                session: "s2".into(),
                 repos: vec!["/r/two".into()],
                 seen: Vec::new(),
-                sig: Vec::new(),
-                sigcheck: now_secs(),
                 updated: 1,
             });
             let live_all = vec![
                 live("w1:p1", "w1:t1", "opencode", "s1"),
-                live("w1:p2", "w1:t1", "opencode", "s-new"),
+                live("w1:p2", "w1:t1", "opencode", "s2"),
             ];
-            assert_eq!(union_for_tab("w1:t1", Some(&live_all)), vec!["/r/one"]);
-            assert!(union_for_tab("w1:t9", Some(&live_all)).is_empty());
-            let fb = union_for_tab("w1:t1", None);
-            assert_eq!(fb.len(), 2);
+            assert_eq!(session_repos("w1:p1", &live_all), vec!["/r/one"]);
+            assert_eq!(session_repos("w1:p2", &live_all), vec!["/r/two"]);
+            assert!(session_repos("w1:p9", &live_all).is_empty());
+            let rotated = vec![live("w1:p1", "w1:t1", "opencode", "s-new")];
+            assert!(session_repos("w1:p1", &rotated).is_empty());
+            let dead = vec![live("w1:p1", "w1:t1", "", "s1")];
+            assert!(session_repos("w1:p1", &dead).is_empty());
         });
     }
 

@@ -190,7 +190,7 @@ fn viewer() -> i32 {
     let me = env::var("HERDR_PANE_ID")
         .ok()
         .filter(|p| !p.is_empty() && *p != agent);
-    let code = tty::run_viewer(&agent, me.clone(), &tab);
+    let code = tty::run_viewer(&agent, me.clone());
     if code == 0 {
         if let Some(me) = me {
             state::remove(&tab);
