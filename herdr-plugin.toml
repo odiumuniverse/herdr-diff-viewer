@@ -1,6 +1,6 @@
 id = "odiumuniverse.diff-viewer"
 name = "Diff Viewer"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
 description = "✨ Beautiful & ⚡ BLAZINGLY FAST git diff sidebar: changed files with red/green hunks, click a file to jump, drag to send lines into the agent prompt. 🦀"

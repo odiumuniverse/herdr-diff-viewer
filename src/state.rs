@@ -45,7 +45,8 @@ pub fn remove(tab: &str) {
 
 pub const MAX_SESSION_REPOS: usize = 64;
 pub const MAX_SEEN: usize = 256;
-pub const MAX_SIG_CANDIDATES: usize = 8;
+pub const MAX_SIG_CANDIDATES: usize = 16;
+pub const MAX_CANDIDATE_CWDS: usize = 16;
 pub const SIG_THROTTLE_SECS: u64 = 5;
 
 pub struct PaneEntry {
@@ -226,6 +227,81 @@ pub fn observe(live: &LivePane, procs: &[(String, String)]) -> PaneEntry {
     e
 }
 
+fn parent_dir(cwd: &str) -> String {
+    std::path::Path::new(cwd)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+fn watch_roots() -> Vec<String> {
+    std::env::var("DIFF_WATCH_ROOTS")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+fn push_candidate(out: &mut Vec<String>, r: String) {
+    if out.len() < MAX_SIG_CANDIDATES && !r.is_empty() && !out.contains(&r) {
+        out.push(r);
+    }
+}
+
+fn candidate_repos(e: &PaneEntry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cwds: Vec<String> = Vec::new();
+    for key in &e.seen {
+        let Some((_, cwd)) = key.split_once('\u{1f}') else {
+            continue;
+        };
+        if !cwds.iter().any(|c| c == cwd) {
+            cwds.push(cwd.to_string());
+        }
+        if cwds.len() >= MAX_CANDIDATE_CWDS {
+            break;
+        }
+    }
+    for cwd in &cwds {
+        if out.len() >= MAX_SIG_CANDIDATES {
+            break;
+        }
+        let Ok(top) = crate::git::toplevel(cwd) else {
+            continue;
+        };
+        push_candidate(&mut out, top.clone());
+        let p = parent_dir(&top);
+        if p.is_empty() || crate::git::is_huge(&p) {
+            continue;
+        }
+        for c in crate::git::child_repos(&p) {
+            if out.len() >= MAX_SIG_CANDIDATES {
+                break;
+            }
+            push_candidate(&mut out, c);
+        }
+    }
+    for r in watch_roots() {
+        if out.len() >= MAX_SIG_CANDIDATES {
+            break;
+        }
+        if crate::git::is_huge(&r) {
+            continue;
+        }
+        if let Ok(top) = crate::git::toplevel(&r) {
+            push_candidate(&mut out, top);
+        }
+        for c in crate::git::child_repos(&r) {
+            if out.len() >= MAX_SIG_CANDIDATES {
+                break;
+            }
+            push_candidate(&mut out, c);
+        }
+    }
+    out
+}
+
 fn check_signatures(e: &mut PaneEntry) -> bool {
     let now = now_secs();
     if now.saturating_sub(e.sigcheck) < SIG_THROTTLE_SECS {
@@ -233,20 +309,7 @@ fn check_signatures(e: &mut PaneEntry) -> bool {
     }
     e.sigcheck = now;
     let mut changed = false;
-    let mut tops: Vec<String> = Vec::new();
-    for key in &e.seen {
-        let Some((_, cwd)) = key.split_once('\u{1f}') else {
-            continue;
-        };
-        if let Ok(top) = crate::git::toplevel(cwd) {
-            if !tops.contains(&top) {
-                tops.push(top);
-            }
-        }
-        if tops.len() >= MAX_SIG_CANDIDATES {
-            break;
-        }
-    }
+    let tops = candidate_repos(e);
     for top in &tops {
         let hash = format!("{:x}", crate::model::signature(std::slice::from_ref(top)));
         let mark = format!("{top}\u{1f}{hash}");
@@ -615,8 +678,9 @@ mod tests {
     #[test]
     fn signature_change_admits_baselined_repo() {
         with_state_dir(|| {
-            let base = std::env::temp_dir().join(format!("dv-sig-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&base);
+            let parent = std::env::temp_dir().join(format!("dv-psig-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&parent);
+            let base = parent.join("repo");
             let sub = base.join("sub");
             fs::create_dir_all(&sub).unwrap();
             let top = init_repo(&base);
@@ -631,7 +695,68 @@ mod tests {
             force_sigcheck("w1:p7");
             let e = observe(&l, &[("1".into(), sub_s)]);
             assert_eq!(e.repos, vec![top]);
-            let _ = fs::remove_dir_all(&base);
+            let _ = fs::remove_dir_all(&parent);
+        });
+    }
+
+    #[test]
+    fn signature_change_admits_sibling_repo() {
+        with_state_dir(|| {
+            let parent = std::env::temp_dir().join(format!("dv-sib-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&parent);
+            let a = parent.join("repoA");
+            let b = parent.join("repoB");
+            let sub = a.join("sub");
+            fs::create_dir_all(&sub).unwrap();
+            fs::create_dir_all(&b).unwrap();
+            let ta = init_repo(&a);
+            let tb = init_repo(&b);
+            let l = live("w1:p8", "w1:t1", "opencode", "ses_sib");
+            let sub_s = sub.to_string_lossy().into_owned();
+            let e = observe(&l, &[("1".into(), sub_s.clone())]);
+            assert!(e.repos.is_empty());
+            force_sigcheck("w1:p8");
+            let e = observe(&l, &[("1".into(), sub_s.clone())]);
+            assert!(e.repos.is_empty());
+            std::fs::write(b.join("f.txt"), "one\ntwo\n").unwrap();
+            force_sigcheck("w1:p8");
+            let e = observe(&l, &[("1".into(), sub_s.clone())]);
+            assert_eq!(e.repos, vec![tb.clone()]);
+            std::fs::write(a.join("g.txt"), "three\n").unwrap();
+            force_sigcheck("w1:p8");
+            let e = observe(&l, &[("1".into(), sub_s)]);
+            assert_eq!(e.repos.len(), 2);
+            assert!(e.repos.contains(&ta));
+            assert!(e.repos.contains(&tb));
+            let _ = fs::remove_dir_all(&parent);
+        });
+    }
+
+    #[test]
+    fn watch_roots_extend_candidates() {
+        with_state_dir(|| {
+            let home = std::env::temp_dir().join(format!("dv-wr-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&home);
+            let work = home.join("work");
+            let far = home.join("far");
+            let repo = far.join("repoC");
+            fs::create_dir_all(&work).unwrap();
+            fs::create_dir_all(&repo).unwrap();
+            let tc = init_repo(&repo);
+            std::env::set_var("DIFF_WATCH_ROOTS", far.to_string_lossy().into_owned());
+            let l = live("w1:p9", "w1:t1", "opencode", "ses_wr");
+            let work_s = work.to_string_lossy().into_owned();
+            let e = observe(&l, &[("1".into(), work_s.clone())]);
+            assert!(e.repos.is_empty());
+            force_sigcheck("w1:p9");
+            let e = observe(&l, &[("1".into(), work_s.clone())]);
+            assert!(e.repos.is_empty());
+            std::fs::write(repo.join("f.txt"), "one\ntwo\n").unwrap();
+            force_sigcheck("w1:p9");
+            let e = observe(&l, &[("1".into(), work_s)]);
+            assert_eq!(e.repos, vec![tc]);
+            std::env::remove_var("DIFF_WATCH_ROOTS");
+            let _ = fs::remove_dir_all(&home);
         });
     }
 
