@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::herdr_cli;
 use crate::hl::{self, ThemeId};
+use crate::journal;
 use crate::model::{self, Snapshot};
 use crate::palette::{self, Palette};
 use crate::render::{self, Body, Frame, Target};
@@ -739,6 +740,34 @@ fn spawn_worker(agent: String, me: Option<String>, _tx: Sender<Msg>) -> Sender<J
 
 const RESCAN_EVERY: u32 = 10;
 
+fn to_live(panes: &[herdr_cli::PaneInfo]) -> Vec<state::LivePane> {
+    panes
+        .iter()
+        .map(|p| state::LivePane {
+            pane: p.pane_id.clone(),
+            tab: p.tab_id.clone(),
+            agent: p.agent.clone(),
+            session: p.session.clone(),
+            cwd: p.cwd.clone(),
+        })
+        .collect()
+}
+
+fn journal_feed(pane: &state::LivePane, cwd: &str) -> Option<state::JournalFeed> {
+    let adapter = journal::adapter_for(&pane.agent)?;
+    let sess = adapter.resolve(cwd, &pane.session)?;
+    let cursor = state::load_entry(&pane.pane)
+        .and_then(|e| e.cursors.get(&pane.agent).cloned())
+        .unwrap_or_default();
+    let edits = adapter.edits(&sess, Some(&cursor)).ok()?;
+    Some(state::JournalFeed {
+        key: pane.agent.clone(),
+        gated: sess.gated,
+        paths: edits.paths,
+        cursor: edits.cursor,
+    })
+}
+
 fn spawn_refresher(
     agent: String,
     theme: ThemeId,
@@ -754,45 +783,37 @@ fn spawn_refresher(
         let mut forced = true;
         let mut ticks: u32 = 0;
         let mut scope_repos: Vec<String> = Vec::new();
+        let mut tree = crate::procs::ProcTree::new();
         loop {
             ticks += 1;
             let mut scope_dirty = forced;
-            match herdr_cli::run(&["pane", "list"]) {
-                Ok(out) => {
-                    let live: Vec<state::LivePane> = herdr_cli::parse_panes(&out)
-                        .into_iter()
-                        .map(|p| state::LivePane {
-                            pane: p.pane_id,
-                            tab: p.tab_id,
-                            agent: p.agent,
-                            session: p.session,
-                        })
-                        .collect();
-                    if live.iter().any(|l| l.pane == agent) {
-                        misses = 0;
-                    } else {
-                        misses += 1;
-                        if misses >= 2 {
-                            let _ = tx.send(Msg::Gone);
-                            return;
+            if let Ok(out) = herdr_cli::run(&["pane", "list"]) {
+                let live = to_live(&herdr_cli::parse_panes(&out));
+                if live.iter().any(|l| l.pane == agent) {
+                    misses = 0;
+                    state::prune(&live);
+                    if let Some(l) = live.iter().find(|l| l.pane == agent) {
+                        if !l.agent.is_empty() {
+                            let (pgid, mut procs) = herdr_cli::pane_procs(&l.pane);
+                            if let Some(root) = pgid {
+                                procs.extend(tree.descendants_cwds(root));
+                                procs.sort();
+                                procs.dedup();
+                            }
+                            let cwd = l.cwd.clone().unwrap_or_default();
+                            let feed = journal_feed(l, &cwd);
+                            state::observe(l, &procs, feed);
                         }
                     }
-                    if misses == 0 {
-                        state::prune(&live);
-                        if let Some(l) = live.iter().find(|l| l.pane == agent) {
-                            let procs = herdr_cli::pane_processes(&l.pane);
-                            state::observe(l, &procs);
-                        }
-                        let u = state::session_repos(&agent, &live);
-                        if u != scope_repos {
-                            scope_repos = u;
-                            scope_dirty = true;
-                        }
+                    let u = state::repos_for(&agent, &live);
+                    if u != scope_repos {
+                        scope_repos = u;
+                        scope_dirty = true;
                     }
-                }
-                Err(_) => {
+                } else {
                     misses += 1;
                     if misses >= 2 {
+                        state::remove_entry(&agent);
                         let _ = tx.send(Msg::Gone);
                         return;
                     }
@@ -843,22 +864,14 @@ fn spawn_refresher(
 }
 
 pub fn run_viewer(agent: &str, me: Option<String>) -> i32 {
-    let live: Option<Vec<state::LivePane>> = herdr_cli::run(&["pane", "list"]).ok().map(|out| {
-        herdr_cli::parse_panes(&out)
-            .into_iter()
-            .map(|p| state::LivePane {
-                pane: p.pane_id,
-                tab: p.tab_id,
-                agent: p.agent,
-                session: p.session,
-            })
-            .collect()
-    });
+    let live: Option<Vec<state::LivePane>> = herdr_cli::run(&["pane", "list"])
+        .ok()
+        .map(|out| to_live(&herdr_cli::parse_panes(&out)));
     if let Some(live) = &live {
         state::prune(live);
     }
     let scope = model::assemble(&match &live {
-        Some(live) => state::session_repos(agent, live),
+        Some(live) => state::repos_for(agent, live),
         None => Vec::new(),
     });
     let tty = match open_ctty() {

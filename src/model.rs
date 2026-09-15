@@ -25,8 +25,6 @@ pub struct Snapshot {
     pub theme: hl::ThemeId,
 }
 
-pub const MAX_REPOS: usize = 32;
-
 pub struct Scope {
     pub repos: Vec<String>,
 }
@@ -40,7 +38,6 @@ pub fn assemble(repos: &[String]) -> Scope {
             }
         }
     }
-    out.truncate(MAX_REPOS);
     Scope { repos: out }
 }
 

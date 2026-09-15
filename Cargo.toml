@@ -1,10 +1,14 @@
 [package]
 name = "diff-viewer"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+sysinfo = "0.39"
 
 [profile.release]
 strip = true

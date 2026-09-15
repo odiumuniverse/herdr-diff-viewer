@@ -4,8 +4,12 @@ use crate::ctx::find_str;
 
 pub const PLUGIN_ID: &str = "odiumuniverse.diff-viewer";
 
+pub fn herdr_bin() -> String {
+    std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
+}
+
 pub fn run(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("herdr")
+    let out = Command::new(herdr_bin())
         .args(args)
         .output()
         .map_err(|e| format!("spawn herdr: {e}"))?;
@@ -87,6 +91,13 @@ pub struct PaneInfo {
     pub tab_id: String,
     pub agent: String,
     pub session: String,
+    pub cwd: Option<String>,
+}
+
+pub fn pick_cwd(json: &str) -> Option<String> {
+    find_str(json, "foreground_cwd")
+        .filter(|s| !s.is_empty())
+        .or_else(|| find_str(json, "cwd").filter(|s| !s.is_empty()))
 }
 
 fn split_array_objects(out: &str, key: &str) -> Vec<String> {
@@ -205,29 +216,13 @@ pub fn parse_panes(out: &str) -> Vec<PaneInfo> {
                 tab_id: find_str(&o, "tab_id").unwrap_or_default(),
                 agent: find_str(&o, "agent").unwrap_or_default(),
                 session: agent_session_value(&o),
+                cwd: pick_cwd(&o),
             })
         })
         .collect()
 }
 
-pub fn parse_pane(out: &str) -> Option<PaneInfo> {
-    let i = out.find("\"pane\"")?;
-    let obj = balanced_obj(&out[i..])?;
-    Some(PaneInfo {
-        pane_id: find_str(&obj, "pane_id")?,
-        tab_id: find_str(&obj, "tab_id").unwrap_or_default(),
-        agent: find_str(&obj, "agent").unwrap_or_default(),
-        session: agent_session_value(&obj),
-    })
-}
-
-pub fn pane_info(pane: &str) -> Option<PaneInfo> {
-    run(&["pane", "get", pane])
-        .ok()
-        .and_then(|out| parse_pane(&out))
-}
-
-pub fn parse_procs(out: &str) -> Vec<(String, String)> {
+pub fn parse_procs(out: &str) -> Vec<(u32, String)> {
     let mut v = Vec::new();
     for o in split_array_objects(out, "foreground_processes") {
         let (Some(pid), Some(cwd)) = (num_field(&o, "\"pid\""), find_str(&o, "cwd")) else {
@@ -236,17 +231,22 @@ pub fn parse_procs(out: &str) -> Vec<(String, String)> {
         if cwd.is_empty() {
             continue;
         }
-        v.push((pid.to_string(), cwd));
+        v.push((pid as u32, cwd));
     }
     v.sort();
     v.dedup();
     v
 }
 
-pub fn pane_processes(pane: &str) -> Vec<(String, String)> {
-    run(&["pane", "process-info", "--pane", pane])
-        .map(|out| parse_procs(&out))
-        .unwrap_or_default()
+pub fn parse_proc_group(out: &str) -> Option<u32> {
+    num_field(out, "\"foreground_process_group_id\"").map(|v| v as u32)
+}
+
+pub fn pane_procs(pane: &str) -> (Option<u32>, Vec<(u32, String)>) {
+    match run(&["pane", "process-info", "--pane", pane]) {
+        Ok(out) => (parse_proc_group(&out), parse_procs(&out)),
+        Err(_) => (None, Vec::new()),
+    }
 }
 
 pub fn pane_rect(out: &str, pane: &str) -> Option<(usize, usize)> {
@@ -326,21 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_get_parses_session() {
-        let out = r#"{"id":"cli:pane:get","result":{"pane":{"agent":"opencode","agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_9"},"cwd":"/Users/u/my/reword-tui","foreground_cwd":"/Users/u/my/reword-tui","pane_id":"w4:p1","tab_id":"w4:t1"}}}"#;
-        let p = parse_pane(out).expect("pane parses");
-        assert_eq!(p.pane_id, "w4:p1");
-        assert_eq!(p.tab_id, "w4:t1");
-        assert_eq!(p.agent, "opencode");
-        assert_eq!(p.session, "ses_9");
-        assert!(parse_pane("garbage").is_none());
-        assert!(parse_pane(r#"{"result":{"pane":{"pane_id":"w4:p9"}}}"#)
-            .is_some_and(|p| p.session.is_empty() && p.agent.is_empty()));
-    }
-
-    #[test]
     fn process_pairs_carry_pid_and_skip_empty() {
         let out = r#"{"result":{"process_info":{
+            "foreground_process_group_id":33795,
             "foreground_processes":[
                 {"argv":["opencode"],"cwd":"/Users/u/my/reword-tui","name":"opencode.exe","pid":33795},
                 {"argv":["go","test"],"cwd":"/Users/u/my/agents-sync","name":"go","pid":44101},
@@ -350,10 +338,11 @@ mod tests {
         assert_eq!(
             parse_procs(out),
             vec![
-                ("33795".to_string(), "/Users/u/my/reword-tui".to_string()),
-                ("44101".to_string(), "/Users/u/my/agents-sync".to_string()),
+                (33795, "/Users/u/my/reword-tui".to_string()),
+                (44101, "/Users/u/my/agents-sync".to_string()),
             ]
         );
+        assert_eq!(parse_proc_group(out), Some(33795));
         assert!(parse_procs("garbage").is_empty());
     }
 }

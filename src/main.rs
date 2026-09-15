@@ -3,8 +3,10 @@ mod git;
 mod group;
 mod herdr_cli;
 mod hl;
+mod journal;
 mod model;
 mod palette;
+mod procs;
 mod render;
 mod screen;
 mod state;
@@ -16,15 +18,47 @@ fn main() {
     let code = match env::args().nth(1).as_deref() {
         Some("toggle") => toggle(),
         Some("viewer") => viewer(),
-        Some("track-event") => track_event(),
         Some("theme") => theme_cmd(),
         Some("themes") => themes(),
+        Some("journals") => journals(),
         _ => {
-            eprintln!("usage: diff-viewer <toggle|viewer|track-event|theme [name]|themes>");
+            eprintln!("usage: diff-viewer <toggle|viewer|theme [name]|themes|journals AGENT [CWD] [SESSION]>");
             2
         }
     };
     std::process::exit(code);
+}
+
+fn journals() -> i32 {
+    let agent = env::args().nth(2).unwrap_or_default();
+    let cwd = env::args().nth(3).unwrap_or_default();
+    let session = env::args().nth(4).unwrap_or_default();
+    let Some(adapter) = journal::adapter_for(&agent) else {
+        eprintln!("no journal adapter for agent '{agent}'");
+        return 1;
+    };
+    let Some(sess) = adapter.resolve(&cwd, &session) else {
+        eprintln!("no session resolved (cwd='{cwd}' session='{session}')");
+        return 1;
+    };
+    println!("id: {}", sess.id);
+    println!("cwd: {:?}", sess.cwd);
+    for src in &sess.sources {
+        println!("source: {}", src.display());
+    }
+    match adapter.edits(&sess, None) {
+        Ok(e) => {
+            println!("paths: {}", e.paths.len());
+            for p in e.paths.iter().take(20) {
+                println!("  {}", p.display());
+            }
+            0
+        }
+        Err(err) => {
+            eprintln!("edits error: {err}");
+            1
+        }
+    }
 }
 
 fn toggle() -> i32 {
@@ -68,70 +102,6 @@ fn toggle() -> i32 {
         },
     );
     0
-}
-
-fn track_event() -> i32 {
-    if std::env::var("DIFF_TRACK").is_ok_and(|v| v == "0") {
-        return 0;
-    }
-    let evt = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
-    let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
-    let event = std::env::var("HERDR_PLUGIN_EVENT").unwrap_or_default();
-    if event == "pane.closed" || event == "pane.exited" {
-        if let Some(pane) = ctx::find_str(&evt, "pane_id") {
-            state::remove_entry(&pane);
-        }
-        return 0;
-    }
-    if event == "tab.closed" {
-        if let Some(tab) = ctx::find_str(&evt, "tab_id") {
-            state::remove_tab(&tab);
-        }
-        return 0;
-    }
-    let pane = ctx::find_str(&evt, "pane_id")
-        .or_else(|| ctx::find_str(&ctx, "focused_pane_id"))
-        .or_else(|| {
-            std::env::var("HERDR_PANE_ID")
-                .ok()
-                .filter(|p| !p.is_empty())
-        });
-    let Some(pane) = pane else {
-        return 0;
-    };
-    let Some(info) = herdr_cli::pane_info(&pane) else {
-        return 0;
-    };
-    if info.agent.is_empty() {
-        state::remove_entry(&pane);
-        return 0;
-    }
-    let live = state::LivePane {
-        pane: info.pane_id.clone(),
-        tab: info.tab_id.clone(),
-        agent: info.agent.clone(),
-        session: info.session.clone(),
-    };
-    if event != "pane.focused" {
-        if let Ok(out) = herdr_cli::run(&["pane", "list"]) {
-            state::prune(&to_live(&herdr_cli::parse_panes(&out)));
-        }
-    }
-    let procs = herdr_cli::pane_processes(&pane);
-    state::observe(&live, &procs);
-    0
-}
-
-fn to_live(panes: &[herdr_cli::PaneInfo]) -> Vec<state::LivePane> {
-    panes
-        .iter()
-        .map(|p| state::LivePane {
-            pane: p.pane_id.clone(),
-            tab: p.tab_id.clone(),
-            agent: p.agent.clone(),
-            session: p.session.clone(),
-        })
-        .collect()
 }
 
 fn theme_cmd() -> i32 {
@@ -199,38 +169,4 @@ fn viewer() -> i32 {
         }
     }
     code
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn track_event_ignores_shell_panes_and_close_events() {
-        let _guard = crate::state::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("dv-track-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("HERDR_PLUGIN_STATE_DIR", &dir);
-        std::env::remove_var("HERDR_PLUGIN_EVENT");
-        std::env::remove_var("HERDR_PLUGIN_CONTEXT_JSON");
-
-        std::env::remove_var("HERDR_PLUGIN_EVENT_JSON");
-        std::env::remove_var("HERDR_PANE_ID");
-        assert_eq!(track_event(), 0);
-
-        std::env::set_var("HERDR_PLUGIN_EVENT", "pane.closed");
-        std::env::set_var("HERDR_PLUGIN_EVENT_JSON", r#"{"pane_id":"w9:p9"}"#);
-        assert_eq!(track_event(), 0);
-        std::env::set_var("HERDR_PLUGIN_EVENT", "tab.closed");
-        std::env::set_var("HERDR_PLUGIN_EVENT_JSON", r#"{"tab_id":"w9:t9"}"#);
-        assert_eq!(track_event(), 0);
-
-        std::env::remove_var("HERDR_PLUGIN_STATE_DIR");
-        std::env::remove_var("HERDR_PLUGIN_EVENT");
-        std::env::remove_var("HERDR_PLUGIN_EVENT_JSON");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

@@ -16,23 +16,47 @@ Git diff sidebar for [herdr](https://github.com): changed files with red/green h
 
 Run the `toggle` action from an agent pane (`Diff viewer: toggle git diff sidebar`).
 
-Scope is **per agent session**, never per tab or pane cwd: a repo enters the
-scope only after a new process of the session's own tree runs with its cwd
-inside that repo. The first sight of a pane only baselines running processes.
-The pane's own cwd repo is never assumed — a session that changed nothing
-there shows nothing from it, even if dirty. Once a repo is in scope, all of
-its uncommitted changes are shown, whoever made them. When the session ends
-(agent exits, session id or agent changes, pane/tab closes) its scope is
-deleted; a new session starts empty. Sessions that never spawn processes
-(pure file edits with zero shell activity) stay invisible to herdr and show
-an empty scope. The viewer follows its own agent pane live — neighbour panes
-never leak in — and background hooks (`pane.created` / `pane.focused` /
-`pane.agent_status_changed`, plus `pane.closed` / `pane.exited` / `tab.closed`
-for cleanup) keep tracking even while the viewer is closed. The header shows
-`watching N` so you always know the blast radius. Untracked files included.
-One broken repo never blanks the view.
+Scope is **per agent session**, never per tab or pane cwd. Two sources feed it:
 
-Opt out of background tracking with `DIFF_TRACK=0`.
+**1. Agent journals (exact).** The viewer reads the session's own transcript and
+adopts every repo the session edited — no cwd assumptions, works even when the
+agent writes to a repo it was not launched in.
+
+| agent | journal | what counts |
+|---|---|---|
+| claude | `~/.claude/projects/<slug>/<session>.jsonl` | Edit/Write/MultiEdit/NotebookEdit + subagent journals |
+| opencode | `~/.local/share/opencode/opencode.db` | `edit`/`write` + `apply_patch` patch text |
+| kilo | `~/.local/share/kilo/kilo.db` | same as opencode |
+| codex | `~/.codex/sessions/**.jsonl` | `apply_patch` / `patch_apply_end` changes |
+| gemini | `~/.gemini/tmp/<project>/chats/session-*` | `write_file`/`replace` tool calls |
+| qwen | `~/.qwen/projects/<slug>/chats/<session>.jsonl` | `edit`/`write_file` tool calls |
+| pi / omp | `~/.pi/…`, `~/.omp/agent/sessions/…` | `edit`/`write` tool calls |
+| antigravity | `…/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl` | `write_to_file`/`replace_file_content` targets |
+| cursor | `~/.cursor/projects/<slug>/agent-transcripts/<conv>.jsonl` + `ai-tracking.db` | best-effort (no cwd in store) |
+| aider | `<repo>/.aider.chat.history.md` | `> Applied edit to <path>` |
+
+**2. Process fallback (signature-gated).** For agents without a journal (and for
+shell-only edits), a repo is adopted when a new process of the session's own
+tree runs with its cwd inside it *and* its working tree changes while the
+session is alive — so a dirty launch repo that the session never touched stays
+invisible. Sources marked best-effort above use the same gate.
+
+The pane's own cwd repo is never assumed. Once a repo is in scope, all of its
+uncommitted changes are shown, whoever made them. Session id or agent change
+resets the scope; a new session starts empty; a confirmed pane close deletes it.
+The viewer follows its own agent pane live — neighbour panes never leak in. The
+header shows `watching N` so you always know the blast radius. Untracked files
+included. One broken repo never blanks the view.
+
+Debug a journal reader from any shell:
+
+```sh
+diff-viewer journals claude "" <session-id>   # cwd + paths the viewer would adopt
+```
+
+Limitations: shell edits that finish between samples and agents with neither a
+journal nor visible child processes are not detected; cursor/aider/antigravity
+blob sources are heuristic and always gated.
 
 Toggle resyncs pane sizes after open/close (`resize --amount 0` is a no-op that still syncs pty winsizes), so neither the viewer nor the agent renders clipped until the next click.
 
