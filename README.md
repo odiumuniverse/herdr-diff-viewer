@@ -25,7 +25,7 @@ agent writes to a repo it was not launched in.
 | agent | journal | what counts |
 |---|---|---|
 | claude | `~/.claude/projects/<slug>/<session>.jsonl` | Edit/Write/MultiEdit/NotebookEdit + subagent journals |
-| opencode | `~/.local/share/opencode/opencode.db` | `edit`/`write` + `apply_patch` patch text |
+| opencode | `~/.local/share/opencode/opencode.db` | `edit`/`write` + `apply_patch` patch text; legacy `part` and v2 `session_message` merged, subagent sessions included |
 | kilo | `~/.local/share/kilo/kilo.db` | same as opencode |
 | codex | `~/.codex/sessions/**.jsonl` | `apply_patch` / `patch_apply_end` changes |
 | gemini | `~/.gemini/tmp/<project>/chats/session-*` | `write_file`/`replace` tool calls |
