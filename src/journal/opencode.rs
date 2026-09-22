@@ -141,6 +141,7 @@ struct Row {
     id: String,
     ts: i64,
     paths: Vec<PathBuf>,
+    candidates: Vec<PathBuf>,
 }
 
 fn parts_v1(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<Row>, String> {
@@ -151,10 +152,11 @@ fn parts_v1(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<Row>
         .prepare(
             "select id, time_updated,
                     coalesce(json_extract(data,'$.state.input.filePath'),''),
-                    coalesce(json_extract(data,'$.state.input.patchText'),'')
+                    coalesce(json_extract(data,'$.state.input.patchText'),''),
+                    coalesce(json_extract(data,'$.state.input.workdir'),'')
              from part
              where session_id = ?1 and time_updated >= ?2
-               and json_extract(data,'$.tool') in ('edit','write','apply_patch')
+               and json_extract(data,'$.tool') in ('edit','write','apply_patch','bash','shell')
              order by time_updated asc, id asc",
         )
         .map_err(|e| e.to_string())?;
@@ -165,12 +167,13 @@ fn parts_v1(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<Row>
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
             ))
         })
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
-        let Ok((id, ts, fp, patch)) = row else {
+        let Ok((id, ts, fp, patch, workdir)) = row else {
             continue;
         };
         let mut paths = Vec::new();
@@ -180,15 +183,26 @@ fn parts_v1(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<Row>
         if !patch.is_empty() {
             paths.extend(patch_paths(&patch));
         }
-        out.push(Row { id, ts, paths });
+        let candidates = if workdir.is_empty() {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(workdir)]
+        };
+        out.push(Row {
+            id,
+            ts,
+            paths,
+            candidates,
+        });
     }
     Ok(out)
 }
 
-fn v2_paths(msg: &serde_json::Value) -> Vec<PathBuf> {
+fn v2_paths(msg: &serde_json::Value) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let mut paths = Vec::new();
+    let mut candidates = Vec::new();
     let Some(content) = msg.get("content").and_then(|c| c.as_array()) else {
-        return paths;
+        return (paths, candidates);
     };
     for part in content {
         if part.get("type").and_then(|t| t.as_str()) != Some("tool") {
@@ -213,10 +227,18 @@ fn v2_paths(msg: &serde_json::Value) -> Vec<PathBuf> {
                     paths.extend(patch_paths(text));
                 }
             }
+            "shell" | "bash" => {
+                let dir = input
+                    .and_then(|i| i.get("workdir").or_else(|| i.get("cwd")))
+                    .and_then(|p| p.as_str());
+                if let Some(dir) = dir {
+                    candidates.push(PathBuf::from(dir));
+                }
+            }
             _ => {}
         }
     }
-    paths
+    (paths, candidates)
 }
 
 fn messages_v2(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<Row>, String> {
@@ -251,10 +273,15 @@ fn messages_v2(conn: &Connection, sess: &SessionRef, since: i64) -> Result<Vec<R
         let Ok((id, ts, data)) = row else {
             continue;
         };
-        let paths = serde_json::from_str::<serde_json::Value>(&data)
+        let (paths, candidates) = serde_json::from_str::<serde_json::Value>(&data)
             .map(|v| v2_paths(&v))
             .unwrap_or_default();
-        out.push(Row { id, ts, paths });
+        out.push(Row {
+            id,
+            ts,
+            paths,
+            candidates,
+        });
     }
     Ok(out)
 }
@@ -267,6 +294,7 @@ fn edits_db(db: &Path, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits,
     rows.sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
 
     let mut paths = Vec::new();
+    let mut candidates = Vec::new();
     let mut last_ts = cur.ts;
     let mut last_ids = cur.ids.clone();
     for row in rows {
@@ -274,10 +302,12 @@ fn edits_db(db: &Path, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits,
             continue;
         }
         paths.extend(row.paths);
+        candidates.extend(row.candidates);
         advance(&mut last_ts, &mut last_ids, row.ts, row.id);
     }
     Ok(Edits {
         paths: absolutize(paths, sess.cwd.as_deref()),
+        candidates: absolutize(candidates, sess.cwd.as_deref()),
         cursor: serde_json::json!({ "ts": last_ts, "ids": last_ids }).to_string(),
     })
 }
@@ -290,6 +320,10 @@ impl Adapter for Opencode {
     fn edits(&self, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> {
         edits_db(&db_path("opencode"), sess, cursor)
     }
+
+    fn shares_process_tree(&self) -> bool {
+        true
+    }
 }
 
 impl Adapter for Kilo {
@@ -299,6 +333,10 @@ impl Adapter for Kilo {
 
     fn edits(&self, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> {
         edits_db(&db_path("kilo"), sess, cursor)
+    }
+
+    fn shares_process_tree(&self) -> bool {
+        true
     }
 }
 
@@ -336,6 +374,16 @@ mod tests {
         conn.execute(
             "insert into part values ('p2', 'm1', 'ses_test', 1, 101, ?1)",
             [patch.to_string()],
+        )
+        .unwrap();
+        let bash = serde_json::json!({
+            "type": "tool",
+            "tool": "bash",
+            "state": {"input": {"command": "go test ./...", "workdir": "/tmp/proj/cmd"}}
+        });
+        conn.execute(
+            "insert into part values ('p3', 'm1', 'ses_test', 1, 102, ?1)",
+            [bash.to_string()],
         )
         .unwrap();
     }
@@ -393,6 +441,12 @@ mod tests {
                 "ses_child",
                 105,
                 serde_json::json!({"content":[{"type":"tool","name":"edit","state":{"input":{"path":"/tmp/proj/src/f.rs"}}}]}),
+            ),
+            (
+                "p7",
+                "ses_parent",
+                106,
+                serde_json::json!({"content":[{"type":"tool","name":"shell","state":{"input":{"command":"go test ./...","workdir":"/tmp/proj/work"}}}]}),
             ),
         ];
         for (id, session, ts, data) in msgs {
@@ -462,10 +516,11 @@ mod tests {
                     PathBuf::from("/tmp/proj/src/c.rs"),
                 ]
             );
+            assert_eq!(edits.candidates, vec![PathBuf::from("/tmp/proj/cmd")]);
             let again = adapter
                 .edits(&sess, Some(&edits.cursor))
                 .expect("idempotent");
-            assert!(again.paths.is_empty());
+            assert!(again.paths.is_empty() && again.candidates.is_empty());
 
             let by_cwd = adapter.resolve("/tmp/proj", "").expect("by cwd");
             assert_eq!(by_cwd.id, "ses_test");
@@ -494,14 +549,16 @@ mod tests {
                     PathBuf::from("/tmp/proj/src/f.rs"),
                 ]
             );
+            assert_eq!(edits.candidates, vec![PathBuf::from("/tmp/proj/work")]);
             let again = adapter
                 .edits(&sess, Some(&edits.cursor))
                 .expect("idempotent");
-            assert!(again.paths.is_empty());
+            assert!(again.paths.is_empty() && again.candidates.is_empty());
 
             let child = adapter.resolve("/tmp/proj", "ses_child").expect("child id");
             let child_edits = adapter.edits(&child, None).expect("child edits");
             assert_eq!(child_edits.paths, vec![PathBuf::from("/tmp/proj/src/f.rs")]);
+            assert!(child_edits.candidates.is_empty());
 
             let by_cwd = adapter.resolve("/tmp/proj", "").expect("by cwd");
             assert_eq!(by_cwd.id, "ses_child", "newest row wins");

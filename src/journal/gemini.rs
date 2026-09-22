@@ -118,6 +118,7 @@ impl Adapter for Gemini {
         if prev_len == Some(len) {
             return Ok(Edits {
                 paths: Vec::new(),
+                candidates: Vec::new(),
                 cursor: cur.to_string(),
             });
         }
@@ -148,6 +149,7 @@ impl Adapter for Gemini {
         cur = serde_json::json!({ "len": len, "ts": ts });
         Ok(Edits {
             paths: absolutize(paths, sess.cwd.as_deref()),
+            candidates: Vec::new(),
             cursor: cur.to_string(),
         })
     }

@@ -152,6 +152,7 @@ fn blob_edits(sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> 
     paths.dedup();
     Ok(Edits {
         paths,
+        candidates: Vec::new(),
         cursor: serde_json::json!({ "idx": max_idx }).to_string(),
     })
 }
@@ -215,6 +216,7 @@ impl Adapter for Antigravity {
         }
         Ok(Edits {
             paths,
+            candidates: Vec::new(),
             cursor: serde_json::to_string(&offsets).unwrap_or_default(),
         })
     }

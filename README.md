@@ -25,7 +25,7 @@ agent writes to a repo it was not launched in.
 | agent | journal | what counts |
 |---|---|---|
 | claude | `~/.claude/projects/<slug>/<session>.jsonl` | Edit/Write/MultiEdit/NotebookEdit + subagent journals |
-| opencode | `~/.local/share/opencode/opencode.db` | `edit`/`write` + `apply_patch` patch text; legacy `part` and v2 `session_message` merged, subagent sessions included |
+| opencode | `~/.local/share/opencode/opencode.db` | `edit`/`write` + `apply_patch` patch text, plus shell `workdir` (gated); legacy `part` and v2 `session_message` merged, subagent sessions included |
 | kilo | `~/.local/share/kilo/kilo.db` | same as opencode |
 | codex | `~/.codex/sessions/**.jsonl` | `apply_patch` / `patch_apply_end` changes |
 | gemini | `~/.gemini/tmp/<project>/chats/session-*` | `write_file`/`replace` tool calls |
@@ -35,11 +35,19 @@ agent writes to a repo it was not launched in.
 | cursor | `~/.cursor/projects/<slug>/agent-transcripts/<conv>.jsonl` + `ai-tracking.db` | best-effort (no cwd in store) |
 | aider | `<repo>/.aider.chat.history.md` | `> Applied edit to <path>` |
 
-**2. Process fallback (signature-gated).** For agents without a journal (and for
+**2. Shell workdirs (gated).** opencode and kilo record the working directory of
+every shell command; those directories join the scope as candidates and are
+adopted only once their working tree changes, so a repo the session merely reads
+stays out.
+
+**3. Process fallback (signature-gated).** For agents without a journal (and for
 shell-only edits), a repo is adopted when a new process of the session's own
 tree runs with its cwd inside it *and* its working tree changes while the
 session is alive — so a dirty launch repo that the session never touched stays
-invisible. Sources marked best-effort above use the same gate.
+invisible. Sources marked best-effort above use the same gate. Agents that
+multiplex every session behind one shared daemon (opencode, kilo) never use the
+fallback: their pane's process tree spans unrelated sessions, so it is not
+walked.
 
 The pane's own cwd repo is never assumed. Once a repo is in scope, all of its
 uncommitted changes are shown, whoever made them. Session id or agent change

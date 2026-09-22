@@ -78,6 +78,7 @@ pub struct JournalFeed {
     pub key: String,
     pub gated: bool,
     pub paths: Vec<PathBuf>,
+    pub candidates: Vec<PathBuf>,
     pub cursor: String,
 }
 
@@ -306,6 +307,12 @@ pub fn observe(live: &LivePane, procs: &[(u32, String)], feed: Option<JournalFee
             } else {
                 changed |= add_repo(&mut e, &top);
             }
+        }
+        for p in &f.candidates {
+            let Some(top) = repo_of(p) else {
+                continue;
+            };
+            changed |= add_candidate(&mut e, &top);
         }
     }
 
@@ -539,11 +546,40 @@ mod tests {
                 key: "claude".into(),
                 gated: false,
                 paths: vec![file],
+                candidates: Vec::new(),
                 cursor: "1".into(),
             };
             let e = observe(&l, &[], Some(feed));
             assert_eq!(e.repos, vec![top]);
             assert_eq!(e.cursors.get("claude").map(String::as_str), Some("1"));
+            let _ = fs::remove_dir_all(&base);
+        });
+    }
+
+    #[test]
+    fn feed_candidates_wait_for_signature_change() {
+        with_state_dir(|| {
+            let base = std::env::temp_dir().join(format!("dv-feed-gate-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir_all(&base).unwrap();
+            let top = init_repo(&base);
+            let l = live("w1:pB", "w1:t1", "opencode", "ses_wd");
+            let feed = |cursor: &str| JournalFeed {
+                key: "opencode".into(),
+                gated: false,
+                paths: Vec::new(),
+                candidates: vec![base.clone()],
+                cursor: cursor.into(),
+            };
+            let e = observe(&l, &[], Some(feed("1")));
+            assert_eq!(e.candidates, vec![top.clone()]);
+            assert!(e.repos.is_empty(), "a workdir alone must not adopt");
+            fs::write(base.join("a.txt"), "one\n").unwrap();
+            let mut e = load_entry("w1:pB").unwrap();
+            e.sig_at.insert(top.clone(), 0);
+            save_entry(&e);
+            let e = observe(&l, &[], Some(feed("2")));
+            assert_eq!(e.repos, vec![top.clone()]);
             let _ = fs::remove_dir_all(&base);
         });
     }
@@ -562,6 +598,7 @@ mod tests {
                 key: "claude".into(),
                 gated: false,
                 paths: vec![file.clone()],
+                candidates: Vec::new(),
                 cursor: "1".into(),
             };
             observe(&a, &[(7, base.to_string_lossy().into_owned())], Some(feed));
@@ -588,6 +625,7 @@ mod tests {
                 key: "claude".into(),
                 gated: false,
                 paths: vec![file],
+                candidates: Vec::new(),
                 cursor: "1".into(),
             };
             observe(&a, &[], Some(feed));

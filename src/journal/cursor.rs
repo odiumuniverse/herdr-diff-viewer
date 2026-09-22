@@ -116,6 +116,7 @@ impl Adapter for Cursor {
         cur["off"] = serde_json::to_value(&offsets).unwrap_or_else(|_| serde_json::json!({}));
         Ok(Edits {
             paths,
+            candidates: Vec::new(),
             cursor: cur.to_string(),
         })
     }

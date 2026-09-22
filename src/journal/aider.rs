@@ -71,6 +71,7 @@ impl Adapter for Aider {
         scan(&text[start..], &mut paths);
         Ok(Edits {
             paths: absolutize(paths, sess.cwd.as_deref()),
+            candidates: Vec::new(),
             cursor: serde_json::json!({ "off": len }).to_string(),
         })
     }

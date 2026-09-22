@@ -21,12 +21,22 @@ pub struct SessionRef {
 #[derive(Clone)]
 pub struct Edits {
     pub paths: Vec<PathBuf>,
+    /// Gated paths (shell workdirs): a repo is adopted only once its working
+    /// tree changes, so a repo the session merely reads stays out.
+    pub candidates: Vec<PathBuf>,
     pub cursor: String,
 }
 
 pub trait Adapter: Sync {
     fn resolve(&self, pane_cwd: &str, session_id: &str) -> Option<SessionRef>;
     fn edits(&self, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String>;
+
+    /// True when every session of the agent runs behind one shared daemon
+    /// (opencode/kilo). The pane's process tree then spans unrelated sessions,
+    /// so the process fallback must not walk it.
+    fn shares_process_tree(&self) -> bool {
+        false
+    }
 }
 
 pub fn adapter_for(agent: &str) -> Option<&'static dyn Adapter> {

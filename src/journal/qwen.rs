@@ -84,6 +84,7 @@ impl Adapter for Qwen {
         }
         Ok(Edits {
             paths: absolutize(paths, base.as_deref()),
+            candidates: Vec::new(),
             cursor: serde_json::to_string(&offsets).unwrap_or_default(),
         })
     }

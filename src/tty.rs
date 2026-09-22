@@ -764,6 +764,7 @@ fn journal_feed(pane: &state::LivePane, cwd: &str) -> Option<state::JournalFeed>
         key: pane.agent.clone(),
         gated: sess.gated,
         paths: edits.paths,
+        candidates: edits.candidates,
         cursor: edits.cursor,
     })
 }
@@ -795,7 +796,9 @@ fn spawn_refresher(
                     if let Some(l) = live.iter().find(|l| l.pane == agent) {
                         if !l.agent.is_empty() {
                             let (pgid, mut procs) = herdr_cli::pane_procs(&l.pane);
-                            if let Some(root) = pgid {
+                            let shared_tree = journal::adapter_for(&l.agent)
+                                .is_some_and(|a| a.shares_process_tree());
+                            if let Some(root) = pgid.filter(|_| !shared_tree) {
                                 procs.extend(tree.descendants_cwds(root));
                                 procs.sort();
                                 procs.dedup();
