@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod cursor;
 pub mod gemini;
+pub mod omp;
 pub mod opencode;
 pub mod pi;
 pub mod qwen;
@@ -48,7 +49,7 @@ pub fn adapter_for(agent: &str) -> Option<&'static dyn Adapter> {
         "gemini" => Some(&gemini::Gemini),
         "qwen" => Some(&qwen::Qwen),
         "pi" => Some(&pi::Pi),
-        "omp" => Some(&pi::Omp),
+        "omp" => Some(&omp::Omp),
         "cursor" => Some(&cursor::Cursor),
         "aider" => Some(&aider::Aider),
         "antigravity" | "antigravity-cli" => Some(&antigravity::Antigravity),

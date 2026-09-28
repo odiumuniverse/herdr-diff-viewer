@@ -30,7 +30,8 @@ agent writes to a repo it was not launched in.
 | codex | `~/.codex/sessions/**.jsonl` | `apply_patch` / `patch_apply_end` changes |
 | gemini | `~/.gemini/tmp/<project>/chats/session-*` | `write_file`/`replace` tool calls |
 | qwen | `~/.qwen/projects/<slug>/chats/<session>.jsonl` | `edit`/`write_file` tool calls |
-| pi / omp | `~/.pi/…`, `~/.omp/agent/sessions/…` | `edit`/`write` tool calls |
+| pi | `~/.pi/agent/sessions/<slug>/<session>.jsonl` | `edit`/`write` tool calls |
+| omp | `~/.omp/agent/sessions/<slug>/<session>.jsonl` + every transcript nested under `<session>/` (subagents, and subagents of subagents) | `edit`/`write` tool calls in both call shapes — the `path` argument and the `[file#hash]` headers of a patch-form call; sessions resolve by transcript path, and a path that no longer exists scopes nothing rather than falling back to a neighbour's transcript |
 | antigravity | `…/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl` | `write_to_file`/`replace_file_content` targets |
 | cursor | `~/.cursor/projects/<slug>/agent-transcripts/<conv>.jsonl` + `ai-tracking.db` | best-effort (no cwd in store) |
 | aider | `<repo>/.aider.chat.history.md` | `> Applied edit to <path>` |

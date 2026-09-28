@@ -4,14 +4,9 @@ use std::path::{Path, PathBuf};
 use super::{absolutize, read_jsonl_since, root, Adapter, Edits, SessionRef};
 
 pub struct Pi;
-pub struct Omp;
 
-fn sessions_root(kind: &str) -> PathBuf {
-    if kind == "omp" {
-        root().join(".omp/agent/sessions")
-    } else {
-        root().join(".pi/agent/sessions")
-    }
+fn sessions_root() -> PathBuf {
+    root().join(".pi/agent/sessions")
 }
 
 fn collect_sessions(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -49,9 +44,9 @@ fn header_cwd(file: &Path) -> Option<String> {
     None
 }
 
-fn resolve_root(kind: &str, pane_cwd: &str, session_id: &str) -> Option<SessionRef> {
+fn resolve_root(pane_cwd: &str, session_id: &str) -> Option<SessionRef> {
     let mut files = Vec::new();
-    collect_sessions(&sessions_root(kind), 3, &mut files);
+    collect_sessions(&sessions_root(), 3, &mut files);
     files.sort_by_key(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok());
     files.reverse();
     let mut picked = None;
@@ -136,17 +131,7 @@ fn edits_root(sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> 
 
 impl Adapter for Pi {
     fn resolve(&self, pane_cwd: &str, session_id: &str) -> Option<SessionRef> {
-        resolve_root("pi", pane_cwd, session_id)
-    }
-
-    fn edits(&self, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> {
-        edits_root(sess, cursor)
-    }
-}
-
-impl Adapter for Omp {
-    fn resolve(&self, pane_cwd: &str, session_id: &str) -> Option<SessionRef> {
-        resolve_root("omp", pane_cwd, session_id)
+        resolve_root(pane_cwd, session_id)
     }
 
     fn edits(&self, sess: &SessionRef, cursor: Option<&str>) -> Result<Edits, String> {
